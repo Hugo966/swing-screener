@@ -1,0 +1,30 @@
+# --- Secrets -----------------------------------------------------------
+.env
+
+# --- Environment -------------------------------------------------------
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# --- Runtime state and outputs -----------------------------------------
+# Local price/fundamentals cache: ~1 GB, fully regenerable from the provider.
+.cache/
+# Alert de-duplication state (SQLite): machine-local, not shareable.
+state.sqlite
+# Daily screener output CSVs.
+out/
+
+# --- Study intermediates -----------------------------------------------
+# Cross-sectional panels: ~28 MB of derived data, regenerable with
+# estudios/top5_semanal/scripts/exportar_transversal.py. The findings live in
+# the committed CSVs; these parquets are the raw material behind them.
+estudios/**/*.parquet
+
+# --- OS / editor -------------------------------------------------------
+.DS_Store
+*.swp
+.idea/
+.vscode/
