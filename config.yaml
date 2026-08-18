@@ -1,0 +1,370 @@
+# =====================================================================
+# Stock Screener — configuración
+# Nada de lógica aquí: solo pesos, umbrales, universos y fuentes.
+# Las claves de API van en .env, NO en este fichero.
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# GATES (binarios; si falla uno, el ticker se descarta sin puntuar)
+# ---------------------------------------------------------------------
+gates:
+  trend:
+    ma_fast: 50
+    ma_slow: 200          # exige precio > MM200 y MM50 > MM200
+  min_market_cap_usd: 2_000_000_000
+  min_dollar_volume_usd: 5_000_000   # liquidez media diaria; ajustar
+  # A1 mira 252 sesiones terminando 21 atrás: por debajo de 273 no es calculable
+  # y el ticker entraría al ranking con la métrica de más peso imputada.
+  min_price_history_days: 280
+  excluded_sectors:      # rompen el panel B (taxonomía de sector de Yahoo)
+    - Financial Services
+    - Real Estate
+  # Yahoo no tiene "Banks"/"Insurance"/"REIT" como sector sino como industria:
+  # se excluyen por subcadena, sin distinguir mayúsculas.
+  excluded_industry_keywords:
+    - bank
+    - insurance
+    - reit
+    - mortgage
+    - capital markets
+
+# ---------------------------------------------------------------------
+# DECISIÓN DE ALERTA
+#   alerta  <=>  gates OK
+#            AND A_pct >= a_threshold
+#            AND B_pct >= b_threshold
+#            AND (A_pct * B_pct/100 * regime) >= final_cut
+# ---------------------------------------------------------------------
+alerting:
+  a_threshold: 80          # percentil momentum (arranque; tunear con backtest)
+  b_threshold: 80          # percentil calidad
+  final_cut: 55            # corte del score combinado tras régimen
+  # El corte es estable día a día: la mayoría de los que pasan hoy pasaban ayer.
+  # Solo se avisa de los nuevos y de los que mejoran de verdad; el resto se
+  # silencia mientras siga en el corte sin moverse.
+  cooldown_days: 10        # ventana en la que un ticker ya avisado no se repite
+  resurface:
+    score_delta: 8         # ...salvo que gane >= 8 puntos de score_final
+    rank_jump: 20          # ...o escale >= 20 puestos en el ranking de la región
+  watchlist:
+    a_threshold: 70        # umbral más laxo para nombres ya vigilados
+    b_threshold: 70
+    final_cut: 45
+    separate_channel: true
+
+# ---------------------------------------------------------------------
+# RÉGIMEN DE MERCADO (multiplicador continuo 0.5..1.0 por región)
+#   trend   = clip((bench/MMslow - 1 + band) / (2*band), 0, 1)
+#   breadth = clip((% sobre MM50 - lo) / (hi - lo), 0, 1)
+#   regime  = min + (max-min) * (w_trend*trend + w_breadth*breadth)
+# ---------------------------------------------------------------------
+regime:
+  min_multiplier: 0.5
+  max_multiplier: 1.0
+  benchmark_ma: 200
+  breadth_ma: 50           # % de valores de la región sobre su MM50
+  band: 0.10               # ±10% alrededor de la MM200 = rampa suave, sin escalón
+  breadth_lo: 0.30         # 30% del universo sobre su MM50 -> amplitud 0
+  breadth_hi: 0.70         # 70% -> amplitud 1
+  weight_trend: 0.6
+  weight_breadth: 0.4
+
+# ---------------------------------------------------------------------
+# COBERTURA DE DATOS
+#   Una métrica sin dato se imputa a percentil 50 (neutro) y se descuenta
+#   de la cobertura. Esto evita alertas sostenidas por imputaciones.
+# ---------------------------------------------------------------------
+coverage:
+  min_panel_coverage: 0.70   # peso mínimo del panel con dato real por ticker
+  min_metric_coverage: 0.50  # si una métrica cubre menos que esto en toda la
+                             # región, se desactiva en esa corrida y se renormaliza
+
+# ---------------------------------------------------------------------
+# PANELES — pesos (cada panel suma 100)
+# ---------------------------------------------------------------------
+panels:
+  momentum:
+    normalize_against: universe      # percentil vs todo el universo de la región
+    # ---------------------------------------------------------------------
+    # PESOS CONGELADOS (v1) · decisión del 18-08-2026
+    #
+    # No reajustar sobre el panel actual. El estudio de estudios/top5_semanal
+    # los validó en las cuatro regiones y la conclusión fue que NO hay base
+    # para afinarlos:
+    #
+    #  - Solo el 52% de la dispersión de IC entre métricas es real; el resto es
+    #    error de medición. El encogimiento empirical-Bayes correcto es k=0,55,
+    #    o sea que cada estimación va a mitad de camino de la media. Tras
+    #    encoger, la mejor métrica queda en +0,023 y la peor en -0,013, con un
+    #    error estándar individual de 0,013. No hay dos ligas de métricas.
+    #  - Con 2,6 años el exceso sobre el índice no es significativo en ninguna
+    #    región (|t| < 0,85). Harían falta ~15 años en EEUU. Cualquier variante
+    #    de pesos cae dentro del ruido por construcción.
+    #  - Un intento anterior (v2: A3 17, A4 5, B1 17, B4 10, B6 12) salía de un
+    #    solo panel y se revirtió al no replicar fuera de EEUU.
+    #
+    # Lo único robusto: A1 y A6 replican en las cuatro regiones (Q de Cochran
+    # 0,21 y 0,72) y ya llevan los pesos 18 y 11. A4 es la única que falla
+    # heterogeneidad con claridad (Q=11,6) — candidata si algún día hay que
+    # tocar una sola cosa.
+    #
+    # Antes de mover cualquier peso, pasar la métrica por
+    # estudios/top5_semanal/scripts/metaanalisis_regiones.py.
+    # ---------------------------------------------------------------------
+    weights:
+      rs_multi_window: 18            # A1  3m/6m/12-1, penaliza +1m
+      distance_to_high: 14          # A2  % bajo ATH + ruptura
+      rs_vs_sector: 12              # A3
+      sector_momentum: 10           # A4
+      consistency_fitp: 11          # A5  frog-in-the-pan
+      vol_adjusted_momentum: 11     # A6  retorno / ATR%
+      accumulation_obv: 9           # A7  OBV + volumen ruptura
+      pead_reaction: 8              # A8  reacción a últimos resultados
+      price_vs_ma: 3                # A9  redundante, testimonial
+      event_proximity: 4            # A10 penaliza, no veta
+
+  quality:
+    normalize_against: sector        # percentil vs sector dentro de la región
+    weights:
+      revenue_growth_level: 14      # B1
+      growth_trend_duration: 13     # B2  pendiente 4T + persistencia
+      earnings_surprise_4q: 9       # B3  media 4T + reacción
+      cash_quality_fcf_ni: 16       # B4  conversión FCF/NI + FCF creciente
+      roic_vs_sector: 11            # B5
+      margin_expansion: 9           # B6
+      dilution_sbc: 10              # B7
+      estimate_revisions: 10        # B8
+      balance_health: 5             # B9  net debt/EBITDA
+      valuation_ev_pct: 3           # B10 EV/S o EV/EBITDA percentil sector
+
+# ---------------------------------------------------------------------
+# PARÁMETROS DE MÉTRICA
+# Nada de esto va hardcodeado en metrics/*.py.
+# ---------------------------------------------------------------------
+metric_params:
+  # --- Panel A ---
+  rs_multi_window:
+    # Longitud de cada ventana; las tres terminan hace skip_recent_days, no hoy
+    # (el "12-1" aplicado a las tres). Necesita m12 + skip sesiones de historia.
+    windows: {m3: 63, m6: 126, m12: 252}
+    weights: {m3: 0.3, m6: 0.3, m12: 0.4}
+    skip_recent_days: 21          # excluye el último mes: reversión a corto
+    reversal_penalty: 0.5         # peso del castigo al retorno de 1m excesivo
+    reversal_threshold: 0.20      # +20% en un mes empieza a penalizar
+  distance_to_high:
+    lookback: 252
+    breakout_window: 20           # ruptura reciente de la base
+    breakout_volume_mult: 1.5     # volumen de ruptura vs media
+    breakout_bonus: 0.10
+  rs_vs_sector:
+    window: 126
+  sector_momentum:
+    window: 126
+    ma: 50
+  consistency_fitp:
+    window: 126
+    gap_threshold: 0.05           # días con salto > 5% no cuentan como goteo
+  vol_adjusted_momentum:
+    window: 126
+    atr_period: 14
+  accumulation_obv:
+    window: 63
+    volume_ma: 50
+  pead_reaction:
+    reaction_days: 3              # salto en los días posteriores a publicar
+    hold_days: 15                 # y si lo mantuvo después
+    max_age_days: 90              # más viejo que esto, ya no informa
+  price_vs_ma:
+    ma_fast: 20
+    ma_slow: 50
+  event_proximity:
+    warn_days: 10                 # a 10 días o menos de resultados, penaliza
+    min_score: 0.3                # suelo: penaliza, nunca veta
+
+  # --- Panel B ---
+  revenue_growth_level: {}
+  growth_trend_duration:
+    strong_growth: 0.20           # "creciendo >20%"
+    tolerant_rule: [2, 3]         # 2 de los últimos 3 periodos
+    slope_weight: 0.4             # pendiente vs persistencia
+  earnings_surprise_4q:
+    quarters: 4
+    reaction_days: 3
+    reaction_weight: 0.35
+  cash_quality_fcf_ni:
+    red_flag_ratio: 0.8           # FCF/NI < 0.8 es bandera roja
+    trend_weight: 0.35            # peso de "FCF creciente" vs nivel de conversión
+  roic_vs_sector: {}
+  margin_expansion:
+    margin: operating             # operating | gross | net
+  dilution_sbc:
+    years: 3
+    sbc_revenue_threshold: 0.15   # SBC > 15% de revenue penaliza
+    sbc_weight: 0.5
+  estimate_revisions:
+    horizon: "+1y"                # periodo de eps_trend/eps_revisions a mirar
+    trend_weight: 0.6             # deriva de la estimación vs recuento up/down
+  balance_health:
+    cap_net_debt_ebitda: 8.0      # tope para que outliers no rompan el percentil
+  valuation_ev_pct:
+    prefer: ev_ebitda             # ev_ebitda con fallback a ev_sales
+
+# ---------------------------------------------------------------------
+# REGIONES
+#   active_metrics: null = todas. En Fase 2 se listan las activas y los
+#   pesos restantes se re-normalizan a 100 automáticamente.
+#   yahoo_regions: códigos de país del screener de Yahoo (su campo "region").
+# ---------------------------------------------------------------------
+regions:
+
+  # --- FASE 1 -------------------------------------------------------
+  us:
+    enabled: true
+    phase: 1
+    provider: yfinance            # fundamentales
+    price_provider: yfinance      # OHLCV
+    benchmark: SPY
+    currency: USD
+    yahoo_regions: [us]
+    close_time_utc: "21:00"       # 16:00 ET; el runner corre después
+    sector_index: synthetic       # equiponderado desde los constituyentes
+    active_metrics: null          # todas
+
+  europe_dev:
+    enabled: true
+    phase: 1
+    provider: yfinance
+    price_provider: yfinance
+    benchmark: "^STOXX"           # STOXX 600
+    currency: EUR
+    # Entrecomillados a propósito: en YAML 1.1 `no` es el booleano falso, no
+    # Noruega. Igual pasaría con `on`, `off`, `y` y `n`.
+    yahoo_regions: ["de", "fr", "gb", "nl", "it", "es", "se", "ch", "dk", "fi",
+                    "no", "be", "ie", "at", "pt"]
+    close_time_utc: "16:35"
+    sector_index: synthetic
+    active_metrics: null
+
+  # --- FASE 2 (deshabilitadas de momento) ---------------------------
+  korea:
+    enabled: true
+    phase: 2
+    # EODHD es de pago; mientras el prototipo vaya con tier gratuito, yfinance
+    # cubre Korea y emergentes. Cambiar de proveedor son estas dos líneas.
+    provider: yfinance
+    price_provider: yfinance
+    benchmark: "^KS11"            # KOSPI
+    currency: KRW
+    yahoo_regions: ["kr"]
+    countries: ["South Korea"]
+    close_time_utc: "06:30"
+    sector_index: synthetic
+    # panel B reducido: sin las métricas que dependen de datos ralos
+    active_metrics:
+      momentum: null
+      quality:
+        - revenue_growth_level
+        - growth_trend_duration
+        - cash_quality_fcf_ni
+        - roic_vs_sector
+        - margin_expansion
+        - balance_health
+        - valuation_ev_pct
+        # desactivadas en EM: earnings_surprise_4q, dilution_sbc, estimate_revisions
+
+  emerging:
+    enabled: true
+    phase: 2
+    provider: yfinance
+    price_provider: yfinance
+    benchmark: EEM               # proxy MSCI EM
+    currency: USD
+    yahoo_regions: ["br", "in", "tw", "za", "mx", "id", "th", "my"]
+    # Sin esto, la cabeza del universo por capitalización son DR de empresas
+    # extranjeras: NVDC34.SA es Nvidia en Brasil y NVDA80.BK es Nvidia en
+    # Tailandia. El filtro va por domicilio de la empresa, no por bolsa.
+    countries: ["Brazil", "India", "Taiwan", "South Africa", "Mexico",
+                "Indonesia", "Thailand", "Malaysia"]
+    close_time_utc: "21:00"
+    sector_index: synthetic
+    active_metrics:
+      momentum: null
+      quality:
+        - revenue_growth_level
+        - growth_trend_duration
+        - cash_quality_fcf_ni
+        - roic_vs_sector
+        - margin_expansion
+        - balance_health
+        - valuation_ev_pct
+
+# ---------------------------------------------------------------------
+# UNIVERSO
+# ---------------------------------------------------------------------
+universe:
+  page_size: 250            # tope por petición del screener de Yahoo
+  max_pages_per_sector: 8
+  max_symbols: null         # tope duro para prototipar (null = sin tope)
+  min_sector_size: 8        # sectores más pequeños percentilan contra la región
+  screener_min_volume: 300_000   # prefiltro barato; el gate real es en dólares
+  # Bolsas que solo replican cotizaciones de otras: no aportan empresas nuevas.
+  # Cboe UK duplica el LSE; IOB son cross-listings de valores no europeos.
+  excluded_exchanges:
+    - Cboe UK
+    - IOB
+
+# ---------------------------------------------------------------------
+# WATCHLIST personal (siempre se puntúa; umbral propio arriba)
+# ---------------------------------------------------------------------
+watchlist: []
+  # - AAPL
+  # - rellenar con tus tickers
+
+# ---------------------------------------------------------------------
+# DATOS / CACHÉ
+#   TTL en horas. Yahoo es una API no oficial: caché agresiva y poca
+#   concurrencia es lo que evita los 429.
+# ---------------------------------------------------------------------
+data:
+  cache_dir: ./.cache
+  max_workers: 6
+  requests_per_minute: 120
+  retry_attempts: 3
+  retry_backoff_seconds: 2.0
+  price_history_period: 3y
+  cache_ttl_hours:
+    prices: 12
+    fundamentals: 168      # 7 días
+    estimates: 24
+    profile: 720           # 30 días
+    universe: 24
+  # Los estados trimestrales se acumulan en disco corrida tras corrida:
+  # Yahoo solo sirve 5 trimestres, pero el histórico local crece con el tiempo
+  # y es además la semilla del archivo point-in-time del backtest (Hito 3).
+  accumulate_statements: true
+
+# ---------------------------------------------------------------------
+# EJECUCIÓN
+# ---------------------------------------------------------------------
+run:
+  schedule: end_of_day          # tras el cierre de cada región (respetar husos)
+  output_dir: ./out
+  state_db: ./state.sqlite
+
+# ---------------------------------------------------------------------------
+# BACKTEST
+#   Lee §11 de spec.md antes de fiarte del resultado. Dos límites del stack
+#   gratuito que NO se pueden arreglar aquí:
+#   - Survivorship: el universo son los que cotizan hoy. Sesga al alza.
+#   - eps_revisions es una foto de hoy sin vintages: B8 no es backtesteable.
+# ---------------------------------------------------------------------------
+backtest:
+  start: null                  # null = todo lo que permitan los datos
+  end: null
+  rebalance: monthly           # monthly | weekly | quarterly
+  horizons_days: [21, 63, 126] # 1, 3 y 6 meses de sesiones
+  price_history_period: 5y
+  # Cuando earnings_dates no cubre un periodo, se retrasa este número de días.
+  # Es peor que la fecha de report real, pero explícito.
+  publication_lag_days: 60
+  threshold_grid: [80, 85, 90, 95]   # del umbral de config hacia arriba
