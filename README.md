@@ -33,6 +33,8 @@ Two caveats about Phase 2 worth holding in mind when reading those numbers:
 
 ## Setup
 
+Requires Python 3.11 or newer.
+
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
@@ -65,7 +67,7 @@ streamlit run screener/panel.py
 before `close_time_utc`, which is what you want under cron:
 
 ```cron
-30 21 * * 1-5  cd /path/to/stock_screener && .venv/bin/python -m screener.runner --region us
+30 21 * * 1-5  cd /path/to/swing-screener && .venv/bin/python -m screener.runner --region us
 ```
 
 The first run downloads everything and is slow; later ones hit the `./.cache`
