@@ -28,3 +28,4 @@ estudios/**/*.parquet
 *.swp
 .idea/
 .vscode/
+logs/

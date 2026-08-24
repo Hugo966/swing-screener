@@ -337,6 +337,70 @@ The expensive artifact is `senales_top20_<region>.json`, holding the top 20 and
 their scores for all 135 weeks: ~50 minutes of computation each, and with them any
 N ≤ 20 or any new exit rule evaluates in seconds.
 
+## Deployment
+
+The screener is a cron job, not a service: it runs for a few minutes a day per
+region and needs no inbound traffic. A small VM with `cron` and local disk is
+enough — measured peak is **0.76 GB of RAM at 27% CPU**, so it is bound by
+network, not compute. Anything with 2 GB of usable memory and 10 GB of disk fits.
+
+`run.sh` wraps the runner for cron. It resolves its own location, so the same
+file works on any machine without editing:
+
+```bash
+./run.sh us
+```
+
+It holds a per-region lock (emerging takes ~45 min cold, and without the lock the
+next day's cron would start on top of it), caps the log, and sends a Telegram
+message if a run fails — a cron that dies silently goes unnoticed until you miss
+the alerts weeks later.
+
+### Setup on a fresh VM
+
+```bash
+sudo apt install -y python3-venv python3-pip git curl cron
+sudo systemctl enable --now cron
+
+git clone <repo> /opt/swing-screener && cd /opt/swing-screener
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python -m pytest -q          # 198 tests, no network: verifies the platform
+
+cp .env.example .env                   # optional: without it, alerts print to console
+```
+
+On a 1 GB instance, add swap before installing — the peak would otherwise hit the
+ceiling mid-run:
+
+```bash
+sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+### Cron
+
+Market closes are in UTC, which is what `close_time_utc` already uses. US and
+emerging both close at 21:00, so they are staggered — emerging has the largest
+universe and firing both at once would hammer the data provider:
+
+```cron
+45  6 * * 1-5  /opt/swing-screener/run.sh korea
+50 16 * * 1-5  /opt/swing-screener/run.sh europe_dev
+15 21 * * 1-5  /opt/swing-screener/run.sh us
+ 0 22 * * 1-5  /opt/swing-screener/run.sh emerging
+```
+
+The first run per region downloads everything cold: ~23 minutes for the US, longer
+for emerging. Later runs hit the cache and take under a minute.
+
+### One machine only
+
+`state.sqlite` decides which alerts have already been sent. Running the screener
+on two machines gives each its own copy, the cooldowns drift apart, and you get
+duplicate alerts for the same stocks. Pick one machine for real runs and use
+`--dry-run` elsewhere — it deliberately records nothing.
+
 ## Disclaimer
 
 **This is a research project, not investment advice.** It produces alerts from a

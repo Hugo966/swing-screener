@@ -229,7 +229,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\nCSV: {path}")
 
         sent = dispatch(run, cfg, dry_run=args.dry_run, send_summary=args.summary)
-        log.info("región %s: %d alertas enviadas", region.key, sent)
+        # En --dry-run `dispatch` solo imprime: decir "enviadas" hace que el log
+        # mienta justo cuando es lo único que se mira en una corrida desatendida.
+        log.info("región %s: %d alertas %s", region.key, sent,
+                 "mostradas" if args.dry_run else "enviadas")
 
     return exit_code
 
