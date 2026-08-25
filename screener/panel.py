@@ -15,9 +15,13 @@ comprobar de un vistazo si el corte está donde quieres.
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import altair as alt
 import pandas as pd
@@ -66,6 +70,11 @@ PALETTES = {
         "highlight": "#eda100",
         "zone_buy": "rgba(12, 163, 12, 0.09)",
         "zone_avoid": "rgba(208, 59, 59, 0.11)",
+        # Estado de frescura del panel. Sobre `surface` claro (#fcfcfb) dan
+        # 4,9:1 y 5,2:1: legibles como texto, no solo como relleno. Los rgba de
+        # `zone_*` no sirven aquí porque son translúcidos y esto es tipografía.
+        "fresh": "#008300",
+        "stale": "#c02626",
     },
     "dark": {
         "surface": "#1a1a19",
@@ -89,6 +98,10 @@ PALETTES = {
         "highlight": "#eda100",
         "zone_buy": "rgba(12, 163, 12, 0.16)",
         "zone_avoid": "rgba(208, 59, 59, 0.20)",
+        # Sobre `surface` oscuro (#1a1a19) hacen falta tonos más claros que en
+        # el tema claro: estos dan 6,1:1 y 5,4:1.
+        "fresh": "#4caf50",
+        "stale": "#ef5350",
     },
 }
 
@@ -602,6 +615,87 @@ def enrich_with_weights(frame: pd.DataFrame, weights: dict[str, float]) -> pd.Da
     return frame.assign(destacada=frame.index.isin(top))
 
 
+@st.cache_data(ttl=60)
+def load_frescura(path: str) -> pd.DataFrame:
+    """Última corrida de cada región, incluidas las que nunca han corrido."""
+    with closing(sqlite3.connect(path)) as conn:
+        conn.row_factory = sqlite3.Row
+        filas = conn.execute(
+            "SELECT region, MAX(run_on) AS run_on, run_at, scored, alerts, regime "
+            "FROM runs GROUP BY region"
+        ).fetchall()
+    return pd.DataFrame([dict(f) for f in filas])
+
+
+def dias_habiles(desde: date, hasta: date) -> int:
+    """Días laborables entre dos fechas.
+
+    Los cron corren de lunes a viernes, así que un lunes la corrida del viernes
+    tiene tres días naturales de antigüedad y es perfectamente normal. Contando
+    en naturales saltaría una alarma falsa cada lunes.
+    """
+    dias = 0
+    cursor = desde
+    while cursor < hasta:
+        cursor += timedelta(days=1)
+        if cursor.weekday() < 5:
+            dias += 1
+    return dias
+
+
+def render_frescura(state_path: str, configuradas: list[str], p: dict) -> None:
+    """Estado de actualización de TODAS las regiones configuradas.
+
+    Se compara contra el config, no contra lo que hay en la base: una región que
+    nunca corrió, o que lleva días caída, no aparecería en `runs` y desaparecería
+    del panel en silencio, que es la peor forma de fallar cuando esto corre
+    desatendido en un servidor.
+    """
+    frescura = load_frescura(state_path).set_index("region")
+    hoy = date.today()
+    columnas = st.columns(len(configuradas))
+
+    for columna, region in zip(columnas, configuradas):
+        with columna:
+            if region not in frescura.index:
+                st.markdown(
+                    f"**{region}**<br><span style='color:{p['stale']}'>sin corridas</span>",
+                    unsafe_allow_html=True)
+                continue
+
+            fila = frescura.loc[region]
+            ultima = date.fromisoformat(str(fila["run_on"]))
+            atraso = dias_habiles(ultima, hoy)
+
+            # `run_at` se guarda en UTC porque el servidor va en UTC y los
+            # cierres de mercado del config también. Pero quien lo lee está en
+            # España, así que se convierte y se etiqueta la zona: un sello sin
+            # zona invita a restar dos horas mentalmente y equivocarse.
+            if fila.get("run_at"):
+                marca = datetime.fromisoformat(str(fila["run_at"]))
+                if marca.tzinfo is None:
+                    marca = marca.replace(tzinfo=timezone.utc)
+                local = marca.astimezone(ZoneInfo("Europe/Madrid"))
+                sello = local.strftime("%d/%m %H:%M") + " (España)"
+            else:
+                sello = str(fila["run_on"])
+
+            if atraso <= 1:
+                color, aviso = p["fresh"], ""
+            elif atraso <= 3:
+                color, aviso = p["highlight"], " ⚠"
+            else:
+                color, aviso = p["stale"], " ⚠"
+
+            cuando = "hoy" if atraso == 0 else f"hace {atraso} día{'s' if atraso > 1 else ''} hábil{'es' if atraso > 1 else ''}"
+            st.markdown(
+                f"**{region}**{aviso}<br>"
+                f"<span style='color:{color}'>{cuando}</span><br>"
+                f"<span style='font-size:0.8em;opacity:0.7'>{sello}<br>"
+                f"{int(fila['scored'])} puntuados · {int(fila['alerts'])} alertas</span>",
+                unsafe_allow_html=True)
+
+
 def main() -> None:
     st.set_page_config(page_title="Stock Screener", page_icon="📈", layout="wide")
     cfg = get_config()
@@ -611,8 +705,11 @@ def main() -> None:
 
     st.title("Stock Screener")
 
-    # --- una sola fila de filtros, arriba, que alcanza a todo -------------
     configured = [key for key, r in cfg.regions.items() if r.enabled]
+    render_frescura(state_path, configured, p)
+    st.divider()
+
+    # --- una sola fila de filtros, arriba, que alcanza a todo -------------
     available = get_state(state_path).regions()
     if not available:
         st.warning("No hay corridas registradas todavía. Lanza la primera desde aquí.")

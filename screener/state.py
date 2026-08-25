@@ -19,7 +19,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 NEW = "nueva"
@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS runs (
     gated         INTEGER,
     scored        INTEGER,
     alerts        INTEGER,
+    run_at        TEXT,
     PRIMARY KEY (region, run_on)
 );
 """
@@ -100,6 +101,12 @@ class AlertState:
         for column, ddl in (("rank", "INTEGER"), ("kind", "TEXT")):
             if column not in existing:
                 conn.execute(f"ALTER TABLE alerts ADD COLUMN {column} {ddl}")
+
+        # `run_on` es solo la fecha; `run_at` guarda el instante exacto para que
+        # el panel pueda avisar de una región que dejó de actualizarse.
+        en_runs = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
+        if "run_at" not in en_runs:
+            conn.execute("ALTER TABLE runs ADD COLUMN run_at TEXT")
 
     # ------------------------------------------------------------------
     # Consulta
@@ -218,8 +225,8 @@ class AlertState:
         with closing(self._connect()) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO runs "
-                "(region, run_on, regime, regime_detail, universe_size, gated, scored, alerts) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "(region, run_on, regime, regime_detail, universe_size, gated, scored, alerts, run_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run.region,
                     today.isoformat(),
@@ -229,6 +236,7 @@ class AlertState:
                     len(run.results) + len(run.dropped_low_coverage),
                     run.scored,
                     len(run.alerts),
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 ),
             )
             conn.commit()
