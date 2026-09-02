@@ -363,8 +363,13 @@ backtest:
   end: null
   rebalance: monthly           # monthly | weekly | quarterly
   horizons_days: [21, 63, 126] # 1, 3 y 6 meses de sesiones
-  price_history_period: 5y
+  # 15y para poder arrancar en 2013 con `provider: sec`. Yahoo sirve esa
+  # profundidad de precios; lo que no servía era el panel B, y eso lo resuelve
+  # la SEC. Con yfinance como proveedor de fundamentales el backtest sigue sin
+  # poder empezar antes de 2024 aunque haya precios de sobra.
+  price_history_period: 15y
   # Cuando earnings_dates no cubre un periodo, se retrasa este número de días.
-  # Es peor que la fecha de report real, pero explícito.
+  # Es peor que la fecha de report real, pero explícito. Con la SEC apenas se
+  # usa: allí la fecha de presentación viaja con cada dato.
   publication_lag_days: 60
   threshold_grid: [80, 85, 90, 95]   # del umbral de config hacia arriba

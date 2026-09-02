@@ -92,12 +92,30 @@ def build_provider(region: Region, cfg) -> DataProvider:
     from screener.data.yfinance_provider import YFinanceProvider
 
     names = {region.provider, region.price_provider}
-    unsupported = names - {"yfinance"}
+    unsupported = names - {"yfinance", "sec"}
     if unsupported:
         raise ProviderError(
-            f"región {region.key!r}: proveedor(es) no implementados en Fase 1: "
-            f"{sorted(unsupported)}. EODHD llega en la Fase 2."
+            f"región {region.key!r}: proveedor(es) no implementados: "
+            f"{sorted(unsupported)}. EODHD sigue pendiente."
         )
 
     yahoo = YFinanceProvider(cfg)
+
+    if region.price_provider == "sec":
+        # La SEC publica cuentas, no cotizaciones. Pedirlas ahí es un error de
+        # configuración y conviene decirlo en el arranque, no a mitad de corrida.
+        raise ProviderError(
+            f"región {region.key!r}: 'sec' no sirve precios, solo fundamentales. "
+            "Usa price_provider: yfinance."
+        )
+
+    if region.provider == "sec":
+        # Fundamentales de la SEC (llegan a 2012 y traen la fecha real de
+        # presentación) sobre precios, sector y universo de Yahoo. Solo para
+        # estudios y backtests largos: carga ~1 GB en memoria.
+        from screener.data.hybrid_provider import HybridFundamentals
+
+        return DataProvider(prices=yahoo, fundamentals=HybridFundamentals(yahoo),
+                            universe=yahoo, name="sec+yfinance")
+
     return DataProvider(prices=yahoo, fundamentals=yahoo, universe=yahoo, name="yfinance")

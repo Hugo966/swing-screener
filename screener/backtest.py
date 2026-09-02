@@ -467,6 +467,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--end", default=None, help="AAAA-MM-DD")
     parser.add_argument("--sweep-horizon", type=int, default=None,
                         help="horizonte en sesiones para el barrido de umbrales")
+    parser.add_argument(
+        "--fundamentals", choices=("yfinance", "sec"), default=None,
+        help="fuente de estados financieros. 'sec' llega a 2013 con fecha de "
+             "presentación real, pero carga ~1 GB en memoria; por eso es una "
+             "opción del backtest y no del config, que también gobierna la "
+             "corrida diaria en una máquina de 1 GB de RAM.")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -481,6 +487,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(args.config)
     params = cfg.raw.get("backtest") or {}
     region = cfg.region(args.region)
+    if args.fundamentals:
+        object.__setattr__(region, "provider", args.fundamentals)
 
     result = run_backtest(
         region, cfg, start=args.start or params.get("start"), end=args.end or params.get("end")
@@ -500,9 +508,21 @@ def main(argv: list[str] | None = None) -> int:
     output.mkdir(parents=True, exist_ok=True)
     alerts = result.alerts_frame()
     if not alerts.empty:
-        path = output / f"backtest_{region.key}.csv"
+        # El proveedor va en el nombre: dos corridas de la misma región con
+        # fuentes distintas se pisaban el CSV, y la segunda borraba en silencio
+        # los resultados de la primera.
+        sufijo = f"_{region.provider}"
+        path = output / f"backtest_{region.key}{sufijo}.csv"
         alerts.to_csv(path, index=False)
         print(f"\nAlertas del backtest: {path}")
+
+        # El retorno del universo por fecha, que es el listón contra el que hay
+        # que medir. Sin él solo se puede contrastar el retorno bruto de las
+        # alertas, y eso en un mercado alcista sale significativo sin que la
+        # estrategia aporte nada.
+        ruta_universo = output / f"backtest_{region.key}{sufijo}_universo.csv"
+        result.universe_frame().to_csv(ruta_universo, index=False)
+        print(f"Universo por fecha:   {ruta_universo}")
     return 0
 
 
