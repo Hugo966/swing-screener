@@ -364,7 +364,7 @@ sudo systemctl enable --now cron
 
 git clone <repo> /opt/swing-screener && cd /opt/swing-screener
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m pytest -q          # 198 tests, no network: verifies the platform
+.venv/bin/python -m pytest -q          # 231 tests, no network: verifies the platform
 
 cp .env.example .env                   # optional: without it, alerts print to console
 ```

@@ -952,4 +952,9 @@ def main() -> None:
             )
 
 
-main()
+# Streamlit ejecuta el script con `__name__ == "__main__"`, así que el panel
+# arranca igual con `streamlit run`. El guard existe para que importar el módulo
+# —lo que hacen los tests— no levante la aplicación entera contra una base de
+# estado que en un clon recién hecho todavía no existe.
+if __name__ == "__main__":
+    main()
