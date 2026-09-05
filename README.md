@@ -380,19 +380,27 @@ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 ### Cron
 
-Market closes are in UTC, which is what `close_time_utc` already uses. US and
-emerging both close at 21:00, so they are staggered — emerging has the largest
-universe and firing both at once would hammer the data provider:
+Market closes are in UTC, which is what `close_time_utc` already uses. Korea and
+Europe are far enough apart to stand alone. US and emerging both close at 21:00,
+so they share one entry and run back to back:
 
 ```cron
 45  6 * * 1-5  /opt/swing-screener/run.sh korea
 50 16 * * 1-5  /opt/swing-screener/run.sh europe_dev
-15 21 * * 1-5  /opt/swing-screener/run.sh us
- 0 22 * * 1-5  /opt/swing-screener/run.sh emerging
+15 21 * * 1-5  /opt/swing-screener/run.sh us; /opt/swing-screener/run.sh emerging
 ```
 
+They are chained rather than staggered by a fixed offset because the US runtime is
+not stable: measured over six sessions it ranged from 19 minutes to 2h24, so any
+fixed gap eventually gets overtaken. The previous 45-minute stagger (`emerging` at
+22:00) overlapped on four of those six days. Overlap matters here because the box
+has 1 GB of RAM and one region alone already peaks at 0.76 GB — two at once pages
+to swap. The `;` runs `emerging` even if `us` exits non-zero; the per-region lock
+in `run.sh` does not help, since it only guards a region against itself.
+
 The first run per region downloads everything cold: ~23 minutes for the US, longer
-for emerging. Later runs hit the cache and take under a minute.
+for emerging. Later runs hit the cache, but "cached" is not "fast" — daily US runs
+in production still take 20 minutes on a warm cache and occasionally hours.
 
 ### One machine only
 
