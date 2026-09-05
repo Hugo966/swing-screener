@@ -125,3 +125,54 @@ def test_history_can_be_filtered_by_symbol(state):
     history = state.history("us", "A")
     assert [row["score"] for row in history] == [90.0, 95.0]
     assert state.snapshot_dates("us") == ["2025-03-11", "2025-03-10"]
+
+
+# ---------------------------------------------------------------------------
+# El eco del cooldown: expirar la ventana no basta para volver a avisar
+# ---------------------------------------------------------------------------
+def snapshots_in_the_cut(state, days, score=70.0):
+    for offset in days:
+        state.record_snapshot(FakeRun([result(score=score)], asof=TODAY + timedelta(days=offset)))
+
+
+def test_a_name_that_never_left_the_cut_stays_silenced_past_the_cooldown(state):
+    """Sin esto, la tanda inicial expira junta y el canal recibe una ráfaga entera."""
+    state.record(result(score=70.0), TODAY, rank=5, kind=NEW)
+    snapshots_in_the_cut(state, range(1, 12))
+
+    decision = state.classify(result(score=70.0), rank=5, today=TODAY + timedelta(days=11), **RULES)
+    assert decision.kind == SILENCED
+    assert not decision.should_send
+
+
+def test_it_is_new_again_if_it_dropped_out_and_came_back(state):
+    """Salir del corte y volver sí es noticia: es una entrada nueva de verdad."""
+    state.record(result(score=70.0), TODAY, rank=5, kind=NEW)
+    fuera = result(score=40.0)
+    fuera.alert = False
+    for offset in range(1, 11):
+        state.record_snapshot(FakeRun([fuera], asof=TODAY + timedelta(days=offset)))
+    snapshots_in_the_cut(state, [11])
+
+    decision = state.classify(result(score=70.0), rank=5, today=TODAY + timedelta(days=11), **RULES)
+    assert decision.kind == NEW
+
+
+def test_falling_out_of_the_ranking_entirely_also_counts_as_leaving(state):
+    """Un valor que ni se puntúa (gate fallado) no sigue en el corte."""
+    state.record(result(score=70.0), TODAY, rank=5, kind=NEW)
+    for offset in range(1, 12):
+        state.record_snapshot(FakeRun([result("OTRO", 90.0)], asof=TODAY + timedelta(days=offset)))
+
+    decision = state.classify(result(score=70.0), rank=5, today=TODAY + timedelta(days=11), **RULES)
+    assert decision.kind == NEW
+
+
+def test_a_real_gain_still_resurfaces_a_long_standing_name(state):
+    """Silenciar por continuidad no puede tapar una mejora de verdad."""
+    state.record(result(score=70.0), TODAY, rank=30, kind=NEW)
+    snapshots_in_the_cut(state, range(1, 12))
+
+    decision = state.classify(result(score=80.0), rank=28, today=TODAY + timedelta(days=11), **RULES)
+    assert decision.kind == IMPROVED
+    assert "+10.0" in decision.detail

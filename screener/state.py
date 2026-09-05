@@ -4,7 +4,8 @@ El corte del §7 es estable día a día: si hoy pasan 51 nombres, mañana pasar�
 unos 51 de los cuales ~45 son los mismos. Reenviarlos todos convierte el canal
 en ruido. Aquí se decide qué llega:
 
-- **nueva**: no había avisado de ella en la ventana de cooldown.
+- **nueva**: no había avisado de ella nunca, o salió del corte y ha vuelto a
+  entrar tras estar fuera. `cooldown_days` mide cuánto ha de estar fuera.
 - **mejora**: ya avisada, pero ha subido de forma significativa — el score gana
   `resurface.score_delta` puntos, o escala `resurface.rank_jump` puestos en el
   ranking de la región respecto a cuando se avisó.
@@ -126,6 +127,36 @@ class AlertState:
         today = today or date.today()
         return self.last_alert(symbol, region, today - timedelta(days=cooldown_days)) is not None
 
+    def _alert_still_standing(self, symbol: str, region: str) -> sqlite3.Row | None:
+        """La última alerta, por vieja que sea, si el valor no ha salido del corte desde ella.
+
+        Sin esto el cooldown es una ventana fija: pasados `cooldown_days` el
+        registro se cae de `last_alert` y un nombre que lleva semanas plantado en
+        el corte vuelve a contar como nuevo. Como la primera tanda entra junta,
+        expira junta, y el canal recibe una ráfaga cada `cooldown_days + 1` días
+        con valores que no se han movido. Medido en producción: 46 alertas el
+        24-ago y 33 el 4-sep, con el corte estable en ~44 todo el intervalo.
+        """
+        previous = self.last_alert(symbol, region, date.min)
+        if previous is None:
+            return None
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT"
+                " (SELECT COUNT(DISTINCT snapshot_on) FROM snapshots"
+                "   WHERE region = ? AND snapshot_on > ?) AS corridas,"
+                " (SELECT COUNT(*) FROM snapshots"
+                "   WHERE region = ? AND symbol = ? AND snapshot_on > ? AND passed = 1) AS en_el_corte",
+                (region, previous["alerted_on"], region, symbol, previous["alerted_on"]),
+            ).fetchone()
+        # Estar ausente del snapshot cuenta como haber salido: un valor que no
+        # llega a puntuarse (gate fallado, datos que faltan) no sigue en el corte.
+        # Y sin snapshots posteriores no hay prueba de continuidad, así que se
+        # respeta el cooldown clásico en vez de silenciar a ciegas.
+        if not row["corridas"]:
+            return None
+        return previous if row["en_el_corte"] == row["corridas"] else None
+
     # ------------------------------------------------------------------
     # Clasificación
     # ------------------------------------------------------------------
@@ -144,6 +175,10 @@ class AlertState:
             return AlertDecision(NEW, "sin cooldown configurado")
 
         previous = self.last_alert(result.symbol, result.region, today - timedelta(days=cooldown_days))
+        if previous is None:
+            # Fuera de la ventana, pero puede llevar ahí desde el aviso: entonces
+            # no es una entrada nueva, es el mismo nombre de siempre.
+            previous = self._alert_still_standing(result.symbol, result.region)
         if previous is None:
             return AlertDecision(NEW, f"nueva en el corte (puesto {rank})")
 
