@@ -203,6 +203,59 @@ def run_region_now(region: str, *, send_alerts: bool) -> int:
     return code
 
 
+def delivery_controls(state_path: str, regions: list[str], sectors: list[str]) -> None:
+    """Qué alertas salen a Telegram, por región y por sector.
+
+    Esto no es un filtro de la vista: el multiselect "Sectores" de arriba cambia
+    lo que se ve aquí y nada más, mientras que estos interruptores los lee el
+    cron cuando manda. Se guardan en la base de estado, que es lo único que
+    comparten los dos procesos.
+
+    Los dos filtros se aplican en AND, y el de sector vale para todas las
+    regiones: apagar Energy lo apaga en us y en emerging a la vez.
+    """
+    state = get_state(state_path)
+    region_prefs = state.delivery_map("region")
+    sector_prefs = state.delivery_map("sector")
+
+    apagadas = [r for r in regions if not region_prefs.get(r, True)]
+    apagados = sorted(s for s, on in sector_prefs.items() if not on)
+    resumen = " · ".join(
+        part
+        for part in (
+            f"{len(apagadas)} región(es) apagada(s)" if apagadas else "",
+            f"{len(apagados)} sector(es) apagado(s)" if apagados else "",
+        )
+        if part
+    )
+
+    with st.expander(f"📤 Envío a Telegram{' — ' + resumen if resumen else ''}"):
+        st.caption(
+            "Apagar algo silencia **solo el mensaje**: la corrida sigue igual y el "
+            "histórico se guarda entero. Y no consume el cooldown, así que al "
+            "reactivarlo te llegará lo que haya en el corte en ese momento."
+        )
+
+        st.markdown("**Regiones**")
+        for region in regions:
+            current = region_prefs.get(region, True)
+            chosen = st.checkbox(region, value=current, key=f"entrega_region_{region}")
+            if chosen != current:
+                state.set_delivery("region", region, chosen)
+
+        if sectors:
+            st.markdown("**Sectores**")
+            for sector in sectors:
+                current = sector_prefs.get(sector, True)
+                chosen = st.checkbox(sector, value=current, key=f"entrega_sector_{sector}")
+                if chosen != current:
+                    state.set_delivery("sector", sector, chosen)
+            st.caption(
+                "La lista son los sectores vistos en la corrida abierta. Los que "
+                "apagues desde otra región siguen apagados aunque no aparezcan aquí."
+            )
+
+
 def update_controls(regions: list[str], current: str) -> None:
     st.subheader("Actualizar")
     target = st.selectbox("Región a recalcular", regions, index=regions.index(current))
@@ -776,8 +829,12 @@ def main() -> None:
     sectors = sorted(detail["sector"].dropna().unique().tolist())
     with st.sidebar:
         chosen_sectors = st.multiselect(
-            "Sectores", sectors, default=[], key=f"sectores_{region}"
+            "Sectores", sectors, default=[], key=f"sectores_{region}",
+            help="Filtra solo lo que se ve. Para elegir qué se envía por "
+                 "Telegram, usa 'Envío a Telegram' más abajo.",
         )
+        st.divider()
+        delivery_controls(state_path, sorted(set(configured) | set(available)), sectors)
 
     view = detail
     if only_alerts:

@@ -140,15 +140,35 @@ always saved, because they are the dashboard's history.
 streamlit run screener/panel.py
 ```
 
-Three tabs: **Ranking** (A_pct vs B_pct scatter — the §7 rule is an AND of two
-thresholds, so the alert zone is literally the upper-right quadrant — plus the
-full table), **Stock detail** (metric-by-metric contribution across both panels
-and the score history) and **Alert history** (with the type, new or improvement,
-and how the regime evolved).
+Three tabs: **Ranking** (A_pct vs B_pct scatter plus the full table), **Stock
+detail** (metric-by-metric contribution across both panels and the score history)
+and **Alert history** (with the type, new or improvement, and how the regime
+evolved). Since the absolute floors decide, the upper-right quadrant is no longer
+the alert zone — a name can sit high on both percentiles and still miss a floor —
+so the green background marks the real alerts rather than the quadrant.
 
 It reads from two places, both written by the runner: `state.sqlite` for KPIs,
 daily rankings and alerts; and `out/<region>_<date>.csv` for the per-metric
 breakdown. History accumulates on its own, run after run.
+
+### Choosing what reaches Telegram
+
+The sidebar has a **📤 Envío a Telegram** panel with a switch per region and per
+sector. The cron reads it from `state.sqlite`, which is the only thing the two
+processes share, so the panel and the runner do not need to be on speaking terms.
+
+Both filters apply as an AND, and the sector switch is global: turning off Energy
+turns it off in `us` and `emerging` at once. Two deliberate choices:
+
+- Turning something off silences **only the message**. The run still happens and
+  the snapshot still records, so the dashboard history stays complete.
+- A suppressed alert is **not** recorded as sent, so it does not burn the
+  cooldown. Switch a region back on and you get whatever is in the cut at that
+  moment, rather than silence until something improves. `dispatch` therefore
+  filters *before* classifying — off means "don't tell me", not "consider it told".
+
+Note this is not the sidebar's **Sectores** multiselect, which filters the view
+and nothing else.
 
 ## Configuration
 
@@ -280,7 +300,7 @@ the whole region is disabled for that run and the weights renormalize.
 .venv/bin/python -m pytest -q
 ```
 
-198 tests, none of which touch the network: synthetic price series and financial
+250 tests, none of which touch the network: synthetic price series and financial
 statements, plus a full pipeline against a fake provider.
 
 First real US run (2026-07-31): 1,627 screener candidates → 1,598 after
@@ -394,7 +414,7 @@ sudo systemctl enable --now cron
 
 git clone <repo> /opt/swing-screener && cd /opt/swing-screener
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m pytest -q          # 231 tests, no network: verifies the platform
+.venv/bin/python -m pytest -q          # 250 tests, no network: verifies the platform
 
 cp .env.example .env                   # optional: without it, alerts print to console
 ```
