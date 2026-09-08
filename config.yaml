@@ -73,16 +73,39 @@ alerting:
   # Mover un número aquí es una decisión de criterio, no un resultado.
   # -------------------------------------------------------------------
   floors:
-    revenue_growth_level: 0.15   # +15% Y/Y: crece de verdad, no es inflación
-    roic_vs_sector: 0.12         # ROIC 12% (NOPAT/capital invertido, nivel
+    revenue_growth_level: 0.25   # +25% Y/Y: crece de verdad, no es inflación
+    roic_vs_sector: 0.18         # ROIC 18% (NOPAT/capital invertido, nivel
                                  # absoluto: el "vs_sector" del nombre se
-                                 # refiere a cómo se percentila, no al crudo)
-    cash_quality_fcf_ni: 0.70    # 70% del beneficio se convierte en caja (Sloan)
-    rs_multi_window: 0.25        # retorno ponderado 3m/6m/12m. Suave a
+                                 # refiere a cómo se percentila, no al crudo).
+                                 # Es el suelo que más filtra con diferencia
+                                 # (650 vetos de los candidatos limpios de las 7
+                                 # corridas, frente a 501 de B1), y es donde uno
+                                 # quiere que venga la exigencia: mide crear
+                                 # valor, no es un proxy de otra cosa.
+    cash_quality_fcf_ni: 0.90    # 90% del beneficio se convierte en caja (Sloan).
+                                 # Parecía contradictorio con exigir crecimiento
+                                 # alto, porque quien crece rápido reinvierte, y
+                                 # la mediana de FCF/NI sí baja con el
+                                 # crecimiento (0,79 → 0,67 → 0,56 en los tramos
+                                 # <15% / 15-30% / >30%). Pero la proporción que
+                                 # supera 1,0 se mantiene plana (33,6% / 28,4% /
+                                 # 30,0%): sí existen empresas que crecen >30% y
+                                 # convierten todo. Exigir las dos no vacía el
+                                 # universo.
+    rs_multi_window: 0.30        # retorno ponderado 3m/6m/12m. El más suave a
                                  # propósito: es retorno absoluto, no vs índice,
                                  # así que depende del mercado y no de la
-                                 # empresa. Un 0,40 anularía el screener en un
-                                 # año lateral por sí solo.
+                                 # empresa, y subirlo mucho anularía el screener
+                                 # en un año lateral por sí solo.
+
+  # Nivel elegido el 08-09-2026: "exquisito, solo las mejores empresas".
+  # Medido sobre las 7 corridas guardadas, deja 44 nombres donde el juego
+  # anterior (0,15/0,12/0,70/0,25) dejaba 128 — del orden de 8-13 por corrida en
+  # us, 4-7 en emerging, 1 en europe_dev y 0 en korea. Con el cooldown eso son
+  # ~1-3 mensajes al día, y algún día sin nada: es lo esperado, no un fallo.
+  # Verificado además que **ningún** nombre se pierde por falta de dato (0 de
+  # 128 candidatos limpios), así que apretar no crea ceguera por huecos de
+  # yfinance; todos los rechazos son por valor.
 
   # Un suelo sobre una métrica inactiva en la región se ignora (el panel B
   # reducido de la Fase 2 no calcula B3/B7/B8). Con la métrica activa pero sin
