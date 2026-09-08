@@ -37,6 +37,24 @@ def test_opposite_zone_is_the_mirror_of_the_buy_zone():
     assert zone_of(20, 21, 80, 80) == ""
 
 
+def test_the_alert_flag_owns_the_buy_zone():
+    """Desde los suelos absolutos, el plano A/B ya no determina la alerta.
+
+    Un nombre arriba en los dos percentiles puede incumplir un suelo, y pintarlo
+    de verde diría lo contrario de lo que hizo el motor.
+    """
+    assert zone_of(95, 95, 50, 50, alert=False) == ""
+    assert zone_of(55, 55, 50, 50, alert=True) == "compra"
+    # sin el flag se mantiene el comportamiento viejo, que es lo que testean los
+    # casos de arriba y lo que usan las líneas del gráfico
+    assert zone_of(95, 95, 50, 50) == "compra"
+
+
+def test_the_opposite_zone_survives_a_non_alerting_name():
+    """El simétrico no depende de la alerta: sigue siendo el reflejo del umbral."""
+    assert zone_of(10, 10, 80, 80, alert=False) == "opuesta"
+
+
 def test_the_middle_has_no_zone():
     for a, b in [(50, 50), (79, 79), (21, 21), (99, 5), (5, 99)]:
         assert zone_of(a, b, 80, 80) == ""

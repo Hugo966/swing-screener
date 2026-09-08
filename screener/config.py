@@ -155,6 +155,32 @@ def _validate_panel_weights(raw: dict[str, Any]) -> None:
             raise ConfigError(f"panel {panel!r}: métricas registradas sin peso: {missing}")
 
 
+def _validate_floors(raw: dict[str, Any]) -> None:
+    """Los suelos absolutos deben nombrar métricas registradas.
+
+    En ejecución, un suelo sobre una métrica que la región no calcula se ignora
+    a propósito (panel B reducido de la Fase 2). Eso significa que un nombre mal
+    escrito aquí no fallaría nunca: sería un filtro que no filtra, dejando pasar
+    todo en silencio. Por eso se valida al cargar y no al decidir.
+    """
+    alerting = raw["alerting"]
+    watchlist = alerting.get("watchlist") or {}
+    for context, floors in (
+        ("alerting.floors", alerting.get("floors")),
+        ("alerting.watchlist.floors", watchlist.get("floors")),
+    ):
+        if not floors:
+            continue
+        if not isinstance(floors, dict):
+            raise ConfigError(f"{context}: debe ser un mapa métrica -> umbral")
+        unknown = sorted(set(floors) - set(REGISTRY))
+        if unknown:
+            raise ConfigError(f"{context}: métricas no registradas: {unknown}")
+        for name, value in floors.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ConfigError(f"{context}: el suelo de {name!r} no es un número: {value!r}")
+
+
 def _build_region(key: str, spec: dict[str, Any], raw: dict[str, Any]) -> Region:
     active = spec.get("active_metrics")
     if active is None:
@@ -223,6 +249,7 @@ def load_config(path: str | Path | None = None, *, load_env: bool = True) -> Con
             raise ConfigError(f"falta el bloque {block!r} en {cfg_path}")
 
     _validate_panel_weights(raw)
+    _validate_floors(raw)
 
     unknown_params = sorted(set(raw.get("metric_params") or {}) - set(REGISTRY))
     if unknown_params:
