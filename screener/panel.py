@@ -546,13 +546,29 @@ def render_podium(frame: pd.DataFrame, column: str, title: str, p: dict,
 # ---------------------------------------------------------------------------
 # Zonas del plano A/B
 # ---------------------------------------------------------------------------
-def zone_of(a_pct: float, b_pct: float, a_threshold: float, b_threshold: float) -> str:
+def zone_of(
+    a_pct: float,
+    b_pct: float,
+    a_threshold: float,
+    b_threshold: float,
+    *,
+    alert: bool | None = None,
+) -> str:
     """Cuadrante de compra, su simétrico, o el centro.
 
     El simétrico no es "lo contrario de alertar" sino su reflejo exacto: tan
     abajo en los dos paneles como habría que estar arriba para alertar.
+
+    `alert` manda sobre la zona de compra cuando se pasa, y el panel lo pasa
+    siempre. Desde que deciden los suelos absolutos, estar arriba en los dos
+    percentiles ya no implica alertar: deducir la zona del plano pintaría de
+    verde nombres que incumplen un suelo. Los umbrales siguen delimitando el
+    cuadrante para el simétrico y para las líneas del gráfico.
     """
-    if a_pct >= a_threshold and b_pct >= b_threshold:
+    if alert is not None:
+        if alert:
+            return "compra"
+    elif a_pct >= a_threshold and b_pct >= b_threshold:
         return "compra"
     if a_pct <= 100 - a_threshold and b_pct <= 100 - b_threshold:
         return "opuesta"
@@ -778,9 +794,13 @@ def main() -> None:
         a_threshold = float(cfg.alerting["a_threshold"])
         b_threshold = float(cfg.alerting["b_threshold"])
         st.caption(
-            f"Alerta = A_pct ≥ {a_threshold:.0f} **y** B_pct ≥ {b_threshold:.0f} "
-            f"**y** score ≥ {cfg.alerting['final_cut']}. Las líneas marcan los dos umbrales: "
-            "el cuadrante superior derecho es la zona de alerta."
+            f"Alerta = **suelos absolutos** (valor crudo: "
+            + ", ".join(f"{REGISTRY[m].label} ≥ {v:g}" for m, v in cfg.alerting["floors"].items())
+            + f") **y** A_pct ≥ {a_threshold:.0f} **y** B_pct ≥ {b_threshold:.0f} "
+            f"**y** score ≥ {cfg.alerting['final_cut']}. Los suelos son el criterio; "
+            "los percentiles solo son red de equilibrio, así que el cuadrante "
+            "superior derecho ya no es la zona de alerta: el fondo verde marca "
+            "las alertas reales."
         )
         if view.empty:
             st.info("Ningún valor cumple los filtros seleccionados.")
@@ -804,8 +824,8 @@ def main() -> None:
             # vez de depender de que el estado del widget sobreviva al rerun.
             chart_slot = st.empty()
             table["zona"] = [
-                zone_of(a, b, a_threshold, b_threshold)
-                for a, b in zip(table["a_pct"], table["b_pct"])
+                zone_of(a, b, a_threshold, b_threshold, alert=bool(hit))
+                for a, b, hit in zip(table["a_pct"], table["b_pct"], table["alert"])
             ]
             counts = table["zona"].value_counts()
             st.caption(

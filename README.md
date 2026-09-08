@@ -77,15 +77,45 @@ directory (prices 12 h, fundamentals 7 days, profile 30 days).
 
 ```
 alert  ⟺  gates OK
-       ∧  A_pct ≥ 80        (good timing)
-       ∧  B_pct ≥ 80        (good company)
-       ∧  (A_pct · B_pct/100 · regime) ≥ 55
+       ∧  floors OK         (good company, in absolute terms)
+       ∧  A_pct ≥ 50        (balance net, not the criterion)
+       ∧  B_pct ≥ 50
+       ∧  (A_pct · B_pct/100 · regime) ≥ 30
 ```
 
 The panels are neither averaged nor combined with `max`: **B decides whether the
-company is worth owning, A decides whether now is the moment.** The starting
-thresholds are 80/80, to be tuned against the backtest. A personal watchlist uses
-its own looser thresholds (70/70) and can route to a separate Telegram channel.
+company is worth owning, A decides whether now is the moment.** A personal
+watchlist uses its own looser thresholds (40/40), looser floors, and can route to
+a separate Telegram channel.
+
+**Why the floors exist.** Percentiles cannot express "nothing is good today":
+`rank(pct=True)` is uniform by construction, so the top 20% always holds 20% of
+the universe. Measured across the seven saved runs, the old 80/80 cut sat between
+4.4% and 6.3% in every large region regardless of what was in it — a quota, not a
+judgement — and it let through names that were plainly bad on one axis, because a
+99th-percentile momentum reading compensates for a negative ROIC inside a weighted
+sum. On 12-Aug one name entered with revenue shrinking 2.3% and four with negative
+ROIC, the worst at −30.5%.
+
+The `floors` in `config.yaml` are absolute thresholds on the **raw** metric value,
+and nothing compensates for them. The percentile thresholds drop to 50, where they
+only veto names that are lopsided across the sixteen metrics that have no floor.
+Across the same seven runs the floors are the first rejection for 96% of the
+universe; `B_pct` and the score cut are never the first reason. The alert count
+becomes a function of how many good companies exist: 3.7% in the US on 18-Aug,
+5.4% in emerging, 0.9% in europe_dev, zero in korea.
+
+Two honest caveats. The floor values are set from economic judgement, **not fitted
+to the backtest** — the long panel only stored percentiles and scores, never raw
+metric values, so they are not testable backwards, and seven runs of a single
+bullish regime would not have the power to calibrate them anyway. And `final_cut`
+still carries the market brake: because it multiplies by `regime`, it demands
+higher percentiles as the market deteriorates (A=B≈55 at regime 0.99, ≈77 at 0.50),
+continuously and without a cliff. That brake does real work — the regime fell below
+0.86 in 55 of the 155 months in the long panel, bottoming at 0.618 in 08-2022. But
+with the nets this low, an excellent name *can* now alert in a deep bear: momentum-crash
+protection rests on the trend gate (price > MA200, MA50 > MA200) and the
+`rs_multi_window` floor, both absolute and per-name, rather than on this cut.
 
 ### What gets sent and what stays quiet
 

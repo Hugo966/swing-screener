@@ -18,6 +18,7 @@ import pandas as pd
 
 from screener import universe as universe_mod
 from screener.data.provider import DataProvider, Estimates, Statements, build_provider
+from screener.metrics import registry
 from screener.models import Candidate, GateResult, Region, TickerData, TickerResult
 from screener.normalize import percentile_rank
 from screener.panels import finalize_panel, prepare_panel
@@ -115,12 +116,69 @@ def fetch_fundamentals(
 # ---------------------------------------------------------------------------
 # Decisión (§7)
 # ---------------------------------------------------------------------------
-def decide(result: TickerResult, cfg) -> None:
-    """AND de dos umbrales altos por percentil, más el corte tras régimen.
+def _active_metrics(cfg, region: str) -> set[str] | None:
+    """Métricas que la región calcula, o None si no se puede saber."""
+    try:
+        weights = cfg.region(region).weights
+    except Exception:  # noqa: BLE001 — región desconocida: no se asume nada
+        return None
+    return {name for panel in weights.values() for name in panel}
 
-    No se promedian los paneles (llenaría las alertas de empresas mediocres pero
-    uniformes) ni se usa max (premia excelencia en una sola dimensión):
-    B decide *si* la empresa merece la pena, A decide *si ahora*.
+
+def _floor_failure(
+    result: TickerResult, floors: dict, require_data: bool, active: set[str] | None
+) -> str | None:
+    """Primer suelo absoluto que el ticker incumple, o None si los pasa todos.
+
+    Los suelos miran el valor **crudo** de la métrica, no su percentil, y son el
+    único juicio absoluto del §7: un percentil no puede decir "hoy no hay nada
+    bueno", porque por construcción siempre existe un top 20%.
+
+    Hay que distinguir dos ausencias que se parecen. Si la región no calcula la
+    métrica (panel B reducido de la Fase 2) el suelo se ignora: es una decisión
+    de configuración, no un hecho sobre la empresa, y fallarla silenciaría
+    regiones enteras. Pero si la métrica está activa y aun así no hay valor
+    medido, eso es falta de dato y con `require_data` falla — si no, un ticker
+    cuyos paneles no se construyeron pasaría todos los suelos por vacío.
+    """
+    if not floors:
+        return None
+
+    measured = {
+        metric.name: metric
+        for panel in (result.momentum, result.quality)
+        if panel is not None
+        for metric in panel.metrics
+    }
+
+    for name, threshold in floors.items():
+        if active is not None and name not in active:
+            continue  # métrica inactiva en esta región
+        floor = float(threshold)
+        label = registry.REGISTRY[name].label if name in registry.REGISTRY else name
+        metric = measured.get(name)
+        raw = metric.raw if metric is not None else None
+        if raw is None:
+            if require_data:
+                return f"{label} sin dato (suelo {floor:.2f})"
+            continue
+        if raw < floor:
+            return f"{label} {raw:.3g} < suelo {floor:.2f}"
+    return None
+
+
+def decide(result: TickerResult, cfg) -> None:
+    """Suelos absolutos primero, percentiles como red, y el corte tras régimen.
+
+    Los suelos deciden *si la empresa es buena*, en valor crudo y sin compensar:
+    antes, la suma ponderada dejaba que un p99 de momentum tapara un ROIC
+    negativo. Los percentiles quedan como red de equilibrio sobre las métricas
+    sin suelo — no se promedian los paneles (llenaría las alertas de empresas
+    mediocres pero uniformes) ni se usa max (premia excelencia en una sola
+    dimensión): B decide *si* la empresa merece la pena, A decide *si ahora*.
+
+    `final_cut` es el freno de mercado. Al ir sobre `A_pct * B_pct/100 * regime`
+    exige percentiles más altos cuanto peor está el mercado, de forma continua.
     """
     base = cfg.alerting
     thresholds = base["watchlist"] if result.is_watchlist else base
@@ -128,10 +186,17 @@ def decide(result: TickerResult, cfg) -> None:
     a_threshold = float(thresholds["a_threshold"])
     b_threshold = float(thresholds["b_threshold"])
     final_cut = float(thresholds.get("final_cut", base["final_cut"]))
+    floors = thresholds.get("floors", base.get("floors")) or {}
+    require_data = bool(base.get("floors_require_data", True))
 
     result.score_final = result.combined
 
-    if result.a_pct < a_threshold:
+    active = _active_metrics(cfg, result.region)
+    floor_failed = _floor_failure(result, floors, require_data, active)
+
+    if floor_failed is not None:
+        result.alert_reason = floor_failed
+    elif result.a_pct < a_threshold:
         result.alert_reason = f"A_pct {result.a_pct:.0f} < {a_threshold:.0f}"
     elif result.b_pct < b_threshold:
         result.alert_reason = f"B_pct {result.b_pct:.0f} < {b_threshold:.0f}"

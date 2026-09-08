@@ -31,14 +31,66 @@ gates:
 # ---------------------------------------------------------------------
 # DECISIÓN DE ALERTA
 #   alerta  <=>  gates OK
-#            AND A_pct >= a_threshold
+#            AND floors OK                          (absoluto: "¿es buena?")
+#            AND A_pct >= a_threshold                (relativo: red de equilibrio)
 #            AND B_pct >= b_threshold
 #            AND (A_pct * B_pct/100 * regime) >= final_cut
+#
+# Por qué los percentiles no pueden ser el criterio: `rank(pct=True)` produce
+# una distribución uniforme, así que "el top 20%" contiene siempre al 20% del
+# universo, sea bueno o malo. Medido en las siete corridas guardadas, el corte
+# se quedaba clavado entre el 4,4% y el 6,3% en las regiones grandes, y dejaba
+# entrar nombres objetivamente malos: el 12-ago pasaron uno con revenue -2,3%
+# y cuatro con ROIC negativo (el peor, -30,5%), porque un p99 de momentum
+# compensa en la suma ponderada lo que debería ser un veto.
+#
+# Los `floors` son ese veto, sobre el valor **crudo** de la métrica. Los
+# percentiles bajan a red de seguridad: solo evitan que entre algo desastroso
+# en las 16 métricas que no tienen suelo. El número de alertas deja de ser una
+# cuota y pasa a depender de cuántas empresas buenas haya — que es el punto.
 # ---------------------------------------------------------------------
 alerting:
-  a_threshold: 80          # percentil momentum (arranque; tunear con backtest)
-  b_threshold: 80          # percentil calidad
-  final_cut: 55            # corte del score combinado tras régimen
+  a_threshold: 50          # percentil momentum — red, ya no criterio
+  b_threshold: 50          # percentil calidad — red, ya no criterio
+
+  # `final_cut` es el freno de mercado, y sigue haciendo falta: el régimen bajó
+  # de 0,86 en 55 de los 155 meses del panel largo, con mínimo 0,618 en
+  # 08-2022. Al multiplicar por `regime`, el corte exige percentiles más altos
+  # cuanto peor está el mercado, de forma continua y sin escalón:
+  #   regime 0,99 -> pide A=B≈55    regime 0,72 -> pide A=B≈65
+  #   regime 0,62 -> pide A=B≈70    regime 0,50 -> pide A=B≈77
+  # A 30 es inerte en las siete corridas actuales (el mínimo que pasa es 31,6),
+  # así que hoy no filtra nada y en bear vuelve a morder.
+  final_cut: 30
+
+  # -------------------------------------------------------------------
+  # SUELOS ABSOLUTOS — valor crudo de la métrica, no percentil.
+  # Fijados por criterio económico, NO ajustados al backtest: el panel largo
+  # solo guardó percentiles y score, no valores crudos, así que estos suelos no
+  # son validables hacia atrás. Y con 7 corridas de un único régimen alcista no
+  # habría potencia para calibrarlos aunque lo fueran — ajustarlos a los datos
+  # es exactamente el error que costó revertir los pesos v2.
+  # Mover un número aquí es una decisión de criterio, no un resultado.
+  # -------------------------------------------------------------------
+  floors:
+    revenue_growth_level: 0.15   # +15% Y/Y: crece de verdad, no es inflación
+    roic_vs_sector: 0.12         # ROIC 12% (NOPAT/capital invertido, nivel
+                                 # absoluto: el "vs_sector" del nombre se
+                                 # refiere a cómo se percentila, no al crudo)
+    cash_quality_fcf_ni: 0.70    # 70% del beneficio se convierte en caja (Sloan)
+    rs_multi_window: 0.25        # retorno ponderado 3m/6m/12m. Suave a
+                                 # propósito: es retorno absoluto, no vs índice,
+                                 # así que depende del mercado y no de la
+                                 # empresa. Un 0,40 anularía el screener en un
+                                 # año lateral por sí solo.
+
+  # Un suelo sobre una métrica inactiva en la región se ignora (el panel B
+  # reducido de la Fase 2 no calcula B3/B7/B8). Con la métrica activa pero sin
+  # dato, el suelo falla: "buena" exige evidencia, no ausencia de pruebas.
+  # Efecto secundario a tener presente: cash_quality_fcf_ni devuelve None si el
+  # beneficio neto no es positivo, así que este suelo implica "que gane dinero".
+  floors_require_data: true
+
   # El corte es estable día a día: la mayoría de los que pasan hoy pasaban ayer.
   # Solo se avisa de los nuevos y de los que mejoran de verdad; el resto se
   # silencia mientras siga en el corte sin moverse.
@@ -47,9 +99,18 @@ alerting:
     score_delta: 8         # ...salvo que gane >= 8 puntos de score_final
     rank_jump: 20          # ...o escale >= 20 puestos en el ranking de la región
   watchlist:
-    a_threshold: 70        # umbral más laxo para nombres ya vigilados
-    b_threshold: 70
-    final_cut: 45
+    a_threshold: 40        # red más laxa para nombres ya vigilados
+    b_threshold: 40
+    # Inerte en su propia esquina (40*40/100 = 16), por el mismo motivo que el
+    # de arriba: un corte por encima del producto de sus umbrales los anularía.
+    final_cut: 15
+    # Suelos más laxos, no ausentes: de un nombre que ya sigues quieres saber
+    # que se mueve antes que exigirle el pleno.
+    floors:
+      revenue_growth_level: 0.05
+      roic_vs_sector: 0.05
+      cash_quality_fcf_ni: 0.30
+      rs_multi_window: 0.10
     separate_channel: true
 
 # ---------------------------------------------------------------------

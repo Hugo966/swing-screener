@@ -139,21 +139,41 @@ pts to 100. This is driven from the `Region`'s `active_metrics`, not by touching
 **Do not average the two scores** (`mean(A,B)` fills the alerts with mediocre-but-uniform
 companies) **and do not use `max`** (which rewards excellence in one dimension — useful for a
 factor portfolio, not for a buy alert where you want a good company **and** good timing). The
-correct rule is an **AND of two high percentile thresholds**:
+correct rule keeps that AND, but the *criterion* is absolute, not relative:
 
 ```
 alert  ⟺  gates OK
-       ∧  A_pct ≥ threshold_A    (good timing;  default 80th percentile)
-       ∧  B_pct ≥ threshold_B    (good company; default 80th percentile)
+       ∧  floors OK              (absolute: raw metric values; the criterion)
+       ∧  A_pct ≥ threshold_A    (good timing;  balance net, default 50th)
+       ∧  B_pct ≥ threshold_B    (good company; balance net, default 50th)
        ∧  (A_pct * B_pct/100 * regime) ≥ final_cut
 ```
+
+**Percentiles alone cannot be the criterion.** `rank(pct=True)` is uniform by
+construction, so "the top 20%" always contains 20% of the universe, however good
+or bad that universe is. Measured over seven saved runs, the 80/80 cut sat at
+4.4%–6.3% in every large region — a quota — and admitted names that were plainly
+bad on one axis, because inside a weighted sum a 99th-percentile momentum reading
+compensates for a negative ROIC. The `floors` are absolute thresholds on the raw
+value and nothing compensates for them; the percentile thresholds drop to a net
+that only vetoes genuine lopsidedness across the metrics that have no floor. Floor
+values are set from **economic judgement, not fitted** — the long panel stored only
+percentiles and scores, so they cannot be validated backwards.
 
 - An excellent company with terrible timing does not fire; a momentum rocket with garbage
   fundamentals does not either. Consistent with the two-panel philosophy: **B decides *whether*
   the company is worth owning, A decides *whether now*.**
-- **Personal watchlist:** same gates, but its own looser threshold (e.g. 70/70) and/or a
-  separate Telegram channel, since these are names already being tracked. Configurable.
-- Starting thresholds **80/80**, to be **tuned against the backtest**.
+- An absolute floor is **not compensable**: this is the whole point of separating it from the
+  weighted sum. A floor naming a metric the region does not compute is ignored (the reduced
+  panel B of Phase 2 is a configuration choice, not a fact about the company); a metric that is
+  active but has no value **fails** the floor, since "good" requires evidence.
+- **Personal watchlist:** same gates, but its own looser thresholds (e.g. 40/40), looser floors
+  and/or a separate Telegram channel, since these are names already being tracked. Configurable.
+- `final_cut` is the market brake. Multiplying by `regime` makes it demand higher percentiles as
+  the market deteriorates (A=B≈55 at regime 0.99, ≈77 at 0.50), continuously and with no cliff.
+  With the nets this low, though, an excellent name *can* alert in a deep bear: momentum-crash
+  protection now rests on the trend gate and the `rs_multi_window` floor, both absolute and
+  per-name.
 
 ## 8. Data sources by phase
 
