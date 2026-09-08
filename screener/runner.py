@@ -117,7 +117,16 @@ def dispatch(run: RegionRun, cfg: Config, *, dry_run: bool, send_summary: bool) 
 
     sent = 0
     silenced = 0
+    undelivered = 0
     for result in run.alerts:
+        # El filtro de entrega va **antes** de clasificar: si se clasificara y
+        # se anotara, apagar una región le consumiría el cooldown y al volver a
+        # encenderla no llegaría nada. Apagado significa "no me lo cuentes",
+        # no "dalo por contado".
+        if not state.should_deliver(result.region, result.sector):
+            undelivered += 1
+            continue
+
         decision = state.classify(
             result,
             ranks.get(result.symbol, 0),
@@ -148,6 +157,8 @@ def dispatch(run: RegionRun, cfg: Config, *, dry_run: bool, send_summary: bool) 
     state.record_run(run)
     if silenced:
         log.info("%d alertas silenciadas (ya avisadas, sin mejora relevante)", silenced)
+    if undelivered:
+        log.info("%d alertas no entregadas (región o sector desactivado en el panel)", undelivered)
 
     if send_summary:
         summary = alerts_mod.format_summary(run.region, run)

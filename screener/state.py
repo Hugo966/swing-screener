@@ -55,6 +55,16 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 CREATE INDEX IF NOT EXISTS snapshots_by_date ON snapshots (region, snapshot_on);
 
+-- Qué se entrega por Telegram. La ausencia de fila significa "activado", así
+-- que una instalación existente no cambia de comportamiento y una región o un
+-- sector nuevos llegan encendidos en vez de desaparecer en silencio.
+CREATE TABLE IF NOT EXISTS delivery (
+    kind    TEXT NOT NULL,   -- 'region' | 'sector'
+    name    TEXT NOT NULL,
+    enabled INTEGER NOT NULL,
+    PRIMARY KEY (kind, name)
+);
+
 CREATE TABLE IF NOT EXISTS runs (
     region        TEXT NOT NULL,
     run_on        TEXT NOT NULL,
@@ -85,6 +95,7 @@ class AlertDecision:
 class AlertState:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        self._delivery_cache: dict[str, dict[str, bool]] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as conn:
             conn.executescript(_SCHEMA)
@@ -156,6 +167,52 @@ class AlertState:
         if not row["corridas"]:
             return None
         return previous if row["en_el_corte"] == row["corridas"] else None
+
+    # ------------------------------------------------------------------
+    # Entrega por Telegram
+    # ------------------------------------------------------------------
+    def delivery_map(self, kind: str) -> dict[str, bool]:
+        """Preferencias guardadas de `kind`. Lo que no está, está activado.
+
+        Se cachea por instancia: `dispatch` pregunta una vez por alerta y sin
+        esto abriría dos conexiones por nombre. `set_delivery` invalida.
+        """
+        cached = self._delivery_cache.get(kind)
+        if cached is not None:
+            return cached
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT name, enabled FROM delivery WHERE kind = ?", (kind,)
+            ).fetchall()
+        prefs = {row["name"]: bool(row["enabled"]) for row in rows}
+        self._delivery_cache[kind] = prefs
+        return prefs
+
+    def set_delivery(self, kind: str, name: str, enabled: bool) -> None:
+        self._delivery_cache.pop(kind, None)
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "INSERT INTO delivery (kind, name, enabled) VALUES (?, ?, ?)"
+                " ON CONFLICT(kind, name) DO UPDATE SET enabled = excluded.enabled",
+                (kind, name, int(enabled)),
+            )
+            conn.commit()
+
+    def should_deliver(self, region: str, sector: str | None) -> bool:
+        """Si la alerta de esta región y sector debe salir a Telegram.
+
+        Los dos filtros son independientes y se aplican en AND: la región manda
+        sobre el canal, el sector sobre el tipo de negocio, y un nombre necesita
+        que las dos cosas estén encendidas. Un sector sin dato no se puede
+        filtrar, así que se entrega — silenciarlo sería esconder justo el caso
+        que hay que revisar.
+        """
+        regions = self.delivery_map("region")
+        if not regions.get(region, True):
+            return False
+        if sector is None:
+            return True
+        return self.delivery_map("sector").get(sector, True)
 
     # ------------------------------------------------------------------
     # Clasificación
