@@ -183,6 +183,48 @@ def market_closed(region: Region, now: datetime | None = None) -> bool:
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
+def apply_floor_overrides(cfg: Config) -> dict[str, float]:
+    """Pisa los suelos de `config.yaml` con los elegidos desde el panel.
+
+    Devuelve los suelos cambiados, o un dict vacío si no había override.
+
+    Va aquí y no en `decide` porque `decide` corre una vez por ticker: leer la
+    base mil veces por corrida para un dato que no cambia durante la corrida no
+    tiene sentido.
+
+    Se loguea a INFO nombrando cada suelo movido. Un override silencioso sería
+    malísimo de depurar: el día que las alertas no cuadren con el YAML, el log
+    tiene que decir por qué sin que haya que ir a mirar la base.
+
+    Ámbito deliberado: esto solo afecta al runner en vivo. `backtest.py` carga el
+    config pero no pasa por `decide` —hace su propio barrido de umbrales—, así
+    que los estudios siguen midiendo los parámetros declarados y no un ajuste
+    hecho a mano desde el panel.
+    """
+    configured = cfg.alerting.get("floors") or {}
+    if not configured:
+        return {}
+
+    effective = AlertState(cfg.run["state_db"]).effective_floors(configured)
+    changed = {
+        name: value
+        for name, value in effective.items()
+        if value != float(configured[name])
+    }
+    if not changed:
+        return {}
+
+    cfg.raw["alerting"]["floors"] = effective
+    log.info(
+        "suelos con override del panel (config.yaml dice otra cosa): %s",
+        ", ".join(
+            f"{name} {float(configured[name]):g} -> {value:g}"
+            for name, value in changed.items()
+        ),
+    )
+    return changed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="screener", description=__doc__)
     parser.add_argument("--region", action="append", help="clave de región; repetible. Por defecto, las habilitadas")
@@ -211,6 +253,7 @@ def main(argv: list[str] | None = None) -> int:
         logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
     cfg = load_config(args.config)
+    apply_floor_overrides(cfg)
     if args.region:
         regions = [cfg.region(key) for key in args.region]
     else:

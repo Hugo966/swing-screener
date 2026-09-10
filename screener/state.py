@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from screener.metrics import REGISTRY
+
 NEW = "nueva"
 IMPROVED = "mejora"
 SILENCED = "silenciada"
@@ -63,6 +65,17 @@ CREATE TABLE IF NOT EXISTS delivery (
     name    TEXT NOT NULL,
     enabled INTEGER NOT NULL,
     PRIMARY KEY (kind, name)
+);
+
+-- Suelos absolutos elegidos desde el panel, que pisan a los de config.yaml.
+-- Vive aquí y no en el YAML porque el panel corre en la misma máquina que el
+-- cron pero en otro proceso, y porque `config.yaml` está bajo git: escribirlo
+-- desde el panel dejaría el repo sucio y el `git pull --ff-only` del despliegue
+-- fallaría. La ausencia de fila significa "sin override", igual que en
+-- `delivery`, así que una base existente no cambia de comportamiento.
+CREATE TABLE IF NOT EXISTS floor_overrides (
+    name  TEXT PRIMARY KEY,
+    value REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -213,6 +226,68 @@ class AlertState:
         if sector is None:
             return True
         return self.delivery_map("sector").get(sector, True)
+
+    # ------------------------------------------------------------------
+    # Suelos absolutos elegidos desde el panel
+    # ------------------------------------------------------------------
+    def floor_overrides(self) -> dict[str, float]:
+        """Suelos que pisan a los de `config.yaml`. Vacío = manda el YAML.
+
+        A diferencia de `delivery_map`, esto **no** se cachea por instancia. Se
+        llama una vez al arrancar el runner y una o dos por render del panel, no
+        una vez por alerta, así que el caché no ahorraba nada — y sí creaba un
+        problema: el panel guarda su `AlertState` en `st.cache_resource`, que
+        vive mientras viva el proceso, y una escritura hecha desde otra instancia
+        dejaba el aviso de "suelos override activos" mostrando algo falso. Ese
+        aviso dice qué está usando Telegram; mentir ahí es lo peor que puede
+        hacer esta pantalla.
+        """
+        with closing(self._connect()) as conn:
+            rows = conn.execute("SELECT name, value FROM floor_overrides").fetchall()
+        return {row["name"]: float(row["value"]) for row in rows}
+
+    def set_floor_overrides(self, floors: dict[str, float] | None) -> None:
+        """Reemplaza el juego entero de overrides; `None` o vacío lo borra.
+
+        Se reemplaza en bloque y no métrica a métrica porque un juego de suelos
+        es una decisión conjunta: dejar tres nuevos y uno viejo daría un cuarto
+        juego que nadie eligió. Y borrarlo todo es la acción "volver a
+        config.yaml", que tiene que existir.
+
+        Un nombre que no esté en el registry se rechaza por el mismo motivo que
+        en `config._validate_floors`: los suelos de métricas que la región no
+        calcula se ignoran a propósito, así que un nombre mal escrito no fallaría
+        nunca — sería un filtro que no filtra, en silencio.
+        """
+        floors = floors or {}
+        unknown = sorted(set(floors) - set(REGISTRY))
+        if unknown:
+            raise ValueError(f"métricas no registradas: {unknown}")
+
+        with closing(self._connect()) as conn:
+            conn.execute("DELETE FROM floor_overrides")
+            if floors:
+                conn.executemany(
+                    "INSERT INTO floor_overrides (name, value) VALUES (?, ?)",
+                    [(name, float(value)) for name, value in floors.items()],
+                )
+            conn.commit()
+
+    def effective_floors(self, configured: dict[str, float]) -> dict[str, float]:
+        """Los suelos que de verdad se aplican, en el orden de `config.yaml`.
+
+        El orden importa: `decide` evalúa los suelos en el orden del dict y el
+        primero que falla es el motivo que se muestra. Un override que cambiara
+        ese orden cambiaría los mensajes sin cambiar ninguna decisión.
+
+        Solo se pisan las claves ya presentes en el config: el override es para
+        mover un umbral, no para inventar un suelo nuevo que `config.yaml` no
+        documenta.
+        """
+        overrides = self.floor_overrides()
+        return {
+            name: float(overrides.get(name, value)) for name, value in configured.items()
+        }
 
     # ------------------------------------------------------------------
     # Clasificación

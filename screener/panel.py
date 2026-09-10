@@ -24,6 +24,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -116,6 +117,86 @@ def palette() -> dict[str, str]:
     return PALETTES.get(mode, PALETTES["light"])
 
 
+FLOOR_KEYS: tuple[str, ...] = (
+    "revenue_growth_level",
+    "roic_vs_sector",
+    "cash_quality_fcf_ni",
+    "rs_multi_window",
+)
+
+# (mínimo, máximo, paso) de cada slider. El paso hace falta también fuera del
+# widget: los valores que interpola la barra maestra se redondean a él, porque
+# si no Streamlit recibe un 0,2333 que no encaja en su propia rejilla.
+FLOOR_LIMITS: dict[str, tuple[float, float, float]] = {
+    "revenue_growth_level": (0.0, 1.00, 0.01),
+    "roic_vs_sector": (0.0, 0.50, 0.01),
+    "cash_quality_fcf_ni": (0.0, 2.00, 0.05),
+    "rs_multi_window": (0.0, 1.50, 0.05),
+}
+
+# Qué mide cada suelo y qué significa moverlo. Va aquí y no en el `help=` del
+# widget para que se lea junto a la definición y no dentro del maquetado.
+# Los cuatro valores son fracciones, no porcentajes: 0,25 es +25%.
+FLOOR_HELP: dict[str, str] = {
+    "revenue_growth_level": (
+        "**Qué mide:** crecimiento de ventas interanual, del trimestre más "
+        "reciente disponible y, si no lo hay, del ejercicio anual.\n\n"
+        "**Subirlo** exige que venda más rápido. A 0,25 solo pasan las que "
+        "facturan un 25% más que hace un año."
+    ),
+    "roic_vs_sector": (
+        "**Qué mide:** NOPAT ÷ capital invertido (deuda más patrimonio, "
+        "promediado de los dos últimos cierres). Sustituye al ROE, que se "
+        "infla apalancando. Es un **nivel absoluto**: el «vs_sector» del "
+        "nombre se refiere a cómo se percentila, no al valor crudo.\n\n"
+        "**Subirlo** exige rentar más sobre el capital. A 0,18 pide un 18%, "
+        "por encima del coste de capital típico, o sea crear valor y no solo "
+        "mover dinero. Es el suelo que más filtra."
+    ),
+    "cash_quality_fcf_ni": (
+        "**Qué mide:** flujo de caja libre ÷ beneficio neto — la anomalía de "
+        "devengos de Sloan: el beneficio sin caja detrás rinde peor.\n\n"
+        "**Subirlo** exige que el beneficio contable sea caja de verdad. A "
+        "0,90 pide que se convierta el 90%.\n\n"
+        "⚠️ No da valor cuando el beneficio neto no es positivo, así que este "
+        "suelo implica **que gane dinero** — y bajarlo a 0 no rescata a esas: "
+        "siguen sin dato y `floors_require_data` las veta."
+    ),
+    "rs_multi_window": (
+        "**Qué mide:** retorno ponderado a 3, 6 y 12 meses (30/30/40%), con "
+        "las tres ventanas desplazadas 21 sesiones hacia atrás y penalizando "
+        "medio punto lo que el último mes exceda del +20%, para no premiar un "
+        "vertical reciente.\n\n"
+        "**Subirlo** exige que ya haya subido más. A 0,30 pide un +30% "
+        "ponderado.\n\n"
+        "⚠️ Es retorno **absoluto, no contra el índice**, así que mide el "
+        "mercado tanto como la empresa. Por eso aprieta menos que los otros "
+        "tres: a 0,40 dejaría el screener a cero en un año lateral."
+    ),
+}
+
+# Senda de exigencia para la barra maestra. Un multiplicador único sobre los
+# cuatro suelos sería un error: están en escalas distintas, y `rs_multi_window`
+# no debe apretar en proporción a los de calidad porque es un retorno absoluto
+# —mide el mercado, no la empresa— y a 0,40 anularía el screener en un año
+# lateral. Estas cuatro anclas son juegos medidos con el `decide()` real sobre
+# las corridas guardadas, y en ellas el RS va deliberadamente rezagado.
+# La tercera es la que corre en producción.
+EXIGENCIA_ANCLAS: tuple[tuple[int, str, dict[str, float]], ...] = (
+    (0, "laxo", {"revenue_growth_level": 0.15, "roic_vs_sector": 0.12,
+                 "cash_quality_fcf_ni": 0.70, "rs_multi_window": 0.25}),
+    (33, "medio", {"revenue_growth_level": 0.20, "roic_vs_sector": 0.15,
+                   "cash_quality_fcf_ni": 0.80, "rs_multi_window": 0.25}),
+    (67, "exquisito", {"revenue_growth_level": 0.25, "roic_vs_sector": 0.18,
+                       "cash_quality_fcf_ni": 0.90, "rs_multi_window": 0.30}),
+    (100, "excepcional", {"revenue_growth_level": 0.30, "roic_vs_sector": 0.20,
+                          "cash_quality_fcf_ni": 1.00, "rs_multi_window": 0.35}),
+)
+
+_GATE_BASE = ("symbol", "name", "sector", "watchlist", "a_pct", "b_pct", "regime", "score_final")
+_GATE_COLS = _GATE_BASE + tuple(f"{m}__raw" for m in FLOOR_KEYS)
+
+
 # ---------------------------------------------------------------------------
 # Carga de datos
 # ---------------------------------------------------------------------------
@@ -156,6 +237,59 @@ def load_detail(output_dir: str, region: str, day: str) -> pd.DataFrame:
     frame = pd.read_csv(path)
     frame["rank"] = frame["score_final"].rank(ascending=False, method="min").astype(int)
     return frame
+
+
+@st.cache_data(ttl=60)
+def corridas_en_disco(output_dir: str, region: str) -> list[str]:
+    """Fechas con CSV en disco, ascendente. El disco manda sobre `snapshots`.
+
+    La rejilla temporal de la pestaña "Estado del corte" la fijan los ficheros y
+    no la base por dos motivos: `snapshots` arrastra filas rancias del
+    INSERT OR REPLACE, y una fecha que estuviera en la base sin CSV se leería
+    como "todo el mundo fuera ese día", partiendo en dos todos los tramos.
+    """
+    prefijo = f"{region}_"
+    return sorted(
+        ruta.stem[len(prefijo):]
+        for ruta in Path(output_dir).glob(f"{prefijo}*.csv")
+        if len(ruta.stem) == len(prefijo) + 10  # <region>_YYYY-MM-DD
+    )
+
+
+@st.cache_data(ttl=60, show_spinner="Cargando el histórico de la región…")
+def load_gate_history(output_dir: str, region: str, days: tuple[str, ...]) -> pd.DataFrame:
+    """Frame largo (símbolo × fecha) con lo justo para recalcular el gate.
+
+    `days` entra en la firma, y como tupla porque tiene que ser hashable, para
+    que la caché se invalide sola en cuanto aparece una corrida nueva en vez de
+    depender del TTL.
+
+    De las ~50 columnas del CSV solo 12 entran al gate; leer el resto
+    multiplicaría por cuatro la memoria del histórico sin usarse. El `reindex`
+    uniforma las regiones (us trae 50 columnas, emerging y korea 44) y también
+    las corridas entre sí, porque `drop_uncovered_metrics` puede desactivar una
+    métrica en un día concreto. Una columna `__raw` ausente queda NaN, que es
+    exactamente lo que `_floor_failure` hace con una métrica activa sin valor.
+    """
+    piezas = []
+    for day in days:
+        ruta = Path(output_dir) / f"{region}_{day}.csv"
+        if not ruta.exists():
+            continue
+        frame = pd.read_csv(ruta, usecols=lambda c: c in _GATE_COLS)
+        frame = frame.reindex(columns=list(_GATE_COLS))
+        frame["snapshot_on"] = day
+        piezas.append(frame)
+
+    if not piezas:
+        return pd.DataFrame(columns=[*_GATE_COLS, "snapshot_on"])
+
+    largo = pd.concat(piezas, ignore_index=True)
+    numericas = ("a_pct", "b_pct", "regime", "score_final", *(f"{m}__raw" for m in FLOOR_KEYS))
+    for columna in numericas:
+        largo[columna] = pd.to_numeric(largo[columna], errors="coerce")
+    largo["watchlist"] = largo["watchlist"].fillna(False).astype(bool)
+    return largo
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +846,773 @@ def dias_habiles(desde: date, hasta: date) -> int:
     return dias
 
 
+# ---------------------------------------------------------------------------
+# Estado del corte (§7 recalculado sobre el histórico)
+# ---------------------------------------------------------------------------
+# Esta vista recalcula el gate desde los CSV en vez de leer la columna `alert` o
+# `snapshots.passed`, por tres motivos independientes:
+#
+# 1. El histórico guardado es incomparable consigo mismo. Los CSV anteriores al
+#    08-09-2026 se escribieron con los umbrales viejos —hay filas con
+#    `reason = "A_pct 76 < 80"` cuando hoy `a_threshold` es 50—, así que leerlos
+#    mostraría un cambio de configuración disfrazado de decenas de empresas
+#    rompiéndose todas el mismo día.
+# 2. `snapshots` arrastra filas rancias: `record_snapshot` usa INSERT OR REPLACE
+#    por `(region, symbol, snapshot_on)`, así que re-ejecutar un día no borra el
+#    universo anterior y quedan ranks duplicados. Los CSV están limpios.
+# 3. Es lo único que permite mover los suelos y ver las entradas y salidas
+#    recalculadas con ellos, que es el sentido de la pestaña.
+
+def redondea_al_paso(valor: float, paso: float) -> float:
+    """Al múltiplo de `paso` más cercano, sin arrastrar ruido binario."""
+    return round(round(valor / paso) * paso, 10)
+
+
+def suelos_de_exigencia(nivel: float) -> dict[str, float]:
+    """Interpola la senda de `EXIGENCIA_ANCLAS` linealmente por tramos.
+
+    Cada valor se redondea al paso de su propio slider, así que las cuatro
+    posiciones ancla devuelven exactamente sus valores medidos y lo de en medio
+    cae siempre en la rejilla de los widgets.
+
+    La escala no pasa de la última ancla: ir más allá exigiría inventar números
+    que nadie ha medido. Quien quiera más exigencia empuja un slider a mano.
+    """
+    niveles = [n for n, _, _ in EXIGENCIA_ANCLAS]
+    nivel = min(max(float(nivel), niveles[0]), niveles[-1])
+
+    for (n0, _, suelos0), (n1, _, suelos1) in zip(EXIGENCIA_ANCLAS, EXIGENCIA_ANCLAS[1:]):
+        if n0 <= nivel <= n1:
+            t = 0.0 if n1 == n0 else (nivel - n0) / (n1 - n0)
+            return {
+                name: redondea_al_paso(
+                    suelos0[name] + t * (suelos1[name] - suelos0[name]),
+                    FLOOR_LIMITS[name][2],
+                )
+                for name in FLOOR_KEYS
+            }
+    return dict(EXIGENCIA_ANCLAS[-1][2])
+
+
+def etiqueta_exigencia(nivel: float) -> str:
+    """Nombre de una posición de la barra: el de su ancla, o "entre A y B".
+
+    No existe la operación inversa —dados unos suelos, qué nivel son— porque el
+    redondeo al paso de cada slider hace que varias posiciones produzcan los
+    mismos suelos: el 67 y el 64 dan exactamente lo mismo. Así que la pestaña
+    compara los suelos actuales contra los que implica la posición de la barra
+    (`suelos_de_exigencia(nivel)`) y con eso decide si son "a medida"; nunca
+    intenta deducir el nivel a partir de los valores.
+    """
+    for n, nombre, _ in EXIGENCIA_ANCLAS:
+        if nivel == n:
+            return nombre
+    for (n0, nombre0, _), (n1, nombre1, _) in zip(EXIGENCIA_ANCLAS, EXIGENCIA_ANCLAS[1:]):
+        if n0 < nivel < n1:
+            return f"entre {nombre0} y {nombre1}"
+    return EXIGENCIA_ANCLAS[-1][1] if nivel > EXIGENCIA_ANCLAS[-1][0] else EXIGENCIA_ANCLAS[0][1]
+
+
+def metricas_activas(cfg, region: str) -> set[str] | None:
+    """Métricas que la región calcula, o None si no se puede saber.
+
+    Equivale a `engine._active_metrics`; se duplica para no importar un privado
+    de otro módulo. La distinción importa: un suelo sobre una métrica que la
+    región no calcula se ignora, mientras que una métrica activa sin dato falla.
+    """
+    try:
+        weights = cfg.region(region).weights
+    except Exception:  # noqa: BLE001 — región desconocida: no se asume nada
+        return None
+    return {name for panel in weights.values() for name in panel}
+
+
+def recompute_gate(
+    frame: pd.DataFrame,
+    *,
+    active: set[str] | None,
+    floors: dict[str, float],
+    a_threshold: float,
+    b_threshold: float,
+    final_cut: float,
+    require_data: bool,
+) -> pd.DataFrame:
+    """Réplica vectorizada de `engine.decide` sobre un frame de filas de CSV.
+
+    Añade `pasa`, `score_calc` y `motivo`. `tests/test_estado_corte.py` la ata a
+    `decide` fila a fila, motivo incluido: si divergen, esta vista pinta de verde
+    lo que el motor no alertó, y una vista que miente es peor que no tenerla.
+
+    El orden de evaluación es el de `decide` —suelos en el orden del dict, luego
+    A_pct, B_pct y el corte final—. Solo afecta a qué motivo se muestra, pero un
+    orden distinto haría que el motivo mintiera.
+
+    El score se recalcula como `a*b/100*regime` en vez de leer `score_final` del
+    CSV, que es lo que hace `decide` con estos mismos números.
+
+    Rama watchlist: no se implementa. `watchlist` es False en todas las filas de
+    todos los CSV porque `watchlist:` está vacío en el config, así que la rama
+    nunca se ejecuta; `render_estado_corte` avisa si algún día deja de serlo, en
+    vez de aplicarle en silencio los umbrales equivocados.
+    """
+    n = len(frame)
+    salida = frame.copy()
+    if n == 0:
+        return salida.assign(
+            pasa=pd.Series(dtype=bool),
+            score_calc=pd.Series(dtype=float),
+            motivo=pd.Series(dtype=object),
+        )
+
+    motivo = np.full(n, "", dtype=object)
+    pendiente = np.ones(n, dtype=bool)  # sigue sin haber fallado nada
+
+    for name, umbral in floors.items():
+        if active is not None and name not in active:
+            continue  # métrica inactiva en la región: el suelo se ignora
+        suelo = float(umbral)
+        etiqueta = REGISTRY[name].label if name in REGISTRY else name
+        columna = f"{name}__raw"
+        # Una columna ausente y un NaN son el mismo caso para `decide`: la
+        # métrica está activa pero no hay valor medido. Pasa cuando
+        # `drop_uncovered_metrics` la desactivó en esa corrida concreta.
+        crudo = (
+            pd.to_numeric(frame[columna], errors="coerce").to_numpy(dtype="float64")
+            if columna in frame.columns
+            else np.full(n, np.nan)
+        )
+        sin_dato = np.isnan(crudo)
+
+        if require_data:
+            fallo = pendiente & sin_dato
+            for i in np.flatnonzero(fallo):
+                motivo[i] = f"{etiqueta} sin dato (suelo {suelo:.2f})"
+            pendiente &= ~fallo
+
+        fallo = pendiente & ~sin_dato & (crudo < suelo)
+        for i in np.flatnonzero(fallo):
+            motivo[i] = f"{etiqueta} {crudo[i]:.3g} < suelo {suelo:.2f}"
+        pendiente &= ~fallo
+
+    a = pd.to_numeric(frame["a_pct"], errors="coerce").to_numpy(dtype="float64")
+    b = pd.to_numeric(frame["b_pct"], errors="coerce").to_numpy(dtype="float64")
+    regime = pd.to_numeric(frame["regime"], errors="coerce").to_numpy(dtype="float64")
+    score = a * b / 100.0 * regime
+
+    for condicion, texto in (
+        (a < a_threshold, lambda i: f"A_pct {a[i]:.0f} < {a_threshold:.0f}"),
+        (b < b_threshold, lambda i: f"B_pct {b[i]:.0f} < {b_threshold:.0f}"),
+        (score < final_cut, lambda i: f"score {score[i]:.1f} < corte {final_cut:.0f}"),
+    ):
+        fallo = pendiente & condicion
+        for i in np.flatnonzero(fallo):
+            motivo[i] = texto(i)
+        pendiente &= ~fallo
+
+    for i in np.flatnonzero(pendiente):
+        motivo[i] = f"A {a[i]:.0f} / B {b[i]:.0f} / score {score[i]:.1f}"
+
+    salida["pasa"] = pendiente
+    salida["score_calc"] = score
+    salida["motivo"] = motivo
+    return salida
+
+
+def matriz_de_pasos(largo: pd.DataFrame, days: tuple[str, ...]) -> pd.DataFrame:
+    """símbolo × fecha -> pasa/no pasa. Sin fila esa fecha cuenta como fuera.
+
+    La ausencia es lo normal, no una anomalía: el universo crece corrida a
+    corrida (745 -> 795 tickers en `us`), y un valor que aún no entraba en el
+    universo no estaba en el corte. Es la misma lectura que hace
+    `state._alert_still_standing`.
+
+    La rejilla de columnas la fijan los CSV que existen: una fecha fantasma
+    pondría a todo el mundo fuera ese día y partiría en dos todos los tramos.
+    """
+    if largo.empty or not days:
+        return pd.DataFrame(index=pd.Index([], name="symbol"), columns=list(days), dtype=bool)
+    matriz = largo.groupby(["symbol", "snapshot_on"])["pasa"].max().unstack(fill_value=False)
+    return matriz.reindex(columns=list(days), fill_value=False).fillna(False).astype(bool)
+
+
+def tramos(matriz: pd.DataFrame) -> pd.DataFrame:
+    """Último tramo continuo dentro del corte, o cuándo salió.
+
+    Se mira la matriz del revés: el primer False empezando por la derecha marca
+    dónde arranca el tramo actual, y el primer True empezando por la derecha
+    marca la última vez que estuvo dentro. Dos `argmax` sobre la matriz entera
+    en lugar de un bucle por símbolo.
+
+    `desde_el_inicio` es el caso honesto: si pasa en TODAS las fechas
+    observadas, la fecha de entrada real es anterior al histórico y no se puede
+    saber. Se etiqueta, no se inventa.
+
+    `corridas_dentro` mide solo el último tramo, así que una reentrada empieza a
+    contar de cero — que es lo que uno quiere saber: cuándo entró *esta* vez.
+    """
+    columnas = [
+        "dentro", "visto", "corridas_dentro", "desde", "desde_el_inicio",
+        "ultima_dentro", "salio_el", "corridas_fuera",
+    ]
+    n = matriz.shape[1]
+    if matriz.empty or n == 0:
+        return pd.DataFrame(columns=columnas, index=matriz.index)
+
+    fechas = np.array(list(matriz.columns), dtype=object)
+    arr = matriz.to_numpy(dtype=bool)
+    rev = arr[:, ::-1]
+
+    dentro = arr[:, -1]
+    visto = arr.any(axis=1)
+    fuera = visto & ~dentro
+
+    # Longitud del tramo final de True. Si la fila es toda True, `argmax` sobre
+    # ~rev devolvería 0 por no encontrar ninguno, de ahí el caso aparte.
+    corridas_dentro = np.where(rev.all(axis=1), n, (~rev).argmax(axis=1))
+    corridas_dentro = np.where(dentro, corridas_dentro, 0)
+    # Índice de la última fecha en la que pasó, para los que ya no están.
+    ultimo = np.where(visto, n - 1 - rev.argmax(axis=1), -1)
+
+    def fecha_en(indice: np.ndarray, mascara: np.ndarray) -> pd.Series:
+        valores = pd.Series(fechas[np.clip(indice, 0, n - 1)], index=matriz.index, dtype=object)
+        return valores.where(pd.Series(mascara, index=matriz.index), other=None)
+
+    return pd.DataFrame(
+        {
+            "dentro": dentro,
+            "visto": visto,  # False = no ha pasado el corte en todo el histórico
+            "corridas_dentro": corridas_dentro,
+            "desde": fecha_en(n - corridas_dentro, dentro),
+            "desde_el_inicio": dentro & (corridas_dentro == n),
+            "ultima_dentro": fecha_en(ultimo, fuera),
+            # La corrida en la que se le vio fuera por primera vez: es cuando la
+            # salida fue observable, no cuando "dejó de ser buena".
+            "salio_el": fecha_en(ultimo + 1, fuera),
+            "corridas_fuera": np.where(fuera, n - 1 - ultimo, 0),
+        },
+        index=matriz.index,
+    )
+
+
+def etiquetar_tramos(info: pd.DataFrame, asof: str) -> pd.DataFrame:
+    """Añade días hábiles y un texto legible a la salida de `tramos`.
+
+    Se ancla a la fecha de la corrida abierta y no a `date.today()`: la
+    antigüedad del panel ya la avisa `render_frescura`, y mezclar los dos relojes
+    haría que el mismo tramo cambiara de tamaño cada lunes.
+    """
+    info = info.copy()
+    if info.empty:
+        for columna in ("dias_dentro", "dias_fuera", "estado", "cuando"):
+            info[columna] = pd.Series(dtype=object)
+        return info
+
+    hasta = date.fromisoformat(asof)
+
+    def habiles(valor) -> int | None:
+        if valor is None or pd.isna(valor):
+            return None
+        return dias_habiles(date.fromisoformat(str(valor)), hasta)
+
+    info["dias_dentro"] = [habiles(v) for v in info["desde"]]
+    info["dias_fuera"] = [habiles(v) for v in info["salio_el"]]
+
+    def habiles_txt(valor) -> str:
+        """`dias_*` es float en pandas por los None, y "0.0 d. háb." se lee mal."""
+        return "" if valor is None or pd.isna(valor) else f" · {int(valor)} d. háb."
+
+    estado, cuando = [], []
+    for fila in info.itertuples():
+        if fila.dentro:
+            estado.append("🟢 dentro")
+            if fila.desde_el_inicio:
+                # No se puede saber cuándo entró de verdad: es anterior al
+                # histórico. Se dice, no se inventa una fecha.
+                cuando.append(f"ya estaba dentro el {fila.desde} (inicio del histórico)")
+            elif fila.corridas_dentro == 1:
+                cuando.append(f"entró en la última corrida ({fila.desde})")
+            else:
+                cuando.append(
+                    f"entró el {fila.desde} · {fila.corridas_dentro} corridas"
+                    + habiles_txt(fila.dias_dentro)
+                )
+        elif fila.visto:
+            estado.append("· salió")
+            if fila.corridas_fuera == 1:
+                cuando.append(f"salió en la última corrida ({fila.salio_el})")
+            else:
+                cuando.append(
+                    f"salió el {fila.salio_el} · {fila.corridas_fuera} corridas fuera"
+                    + habiles_txt(fila.dias_fuera)
+                )
+        else:
+            estado.append("· nunca")
+            cuando.append("no ha pasado el corte en el histórico")
+
+    info["estado"] = estado
+    info["cuando"] = cuando
+    return info
+
+
+def corte_styler(view: pd.DataFrame, verdes: pd.Series, p: dict):
+    """Verde sólido en el texto de las que pasan el corte; el resto, tinta normal.
+
+    Se colorea **texto**, así que se usan `fresh`/`stale` de la paleta, que son
+    los sólidos pensados para tipografía; los `zone_*` son rgba translúcidos y
+    solo valen de fondo. Y "negro" no se pone literal: en tema oscuro sería
+    invisible, de ahí `p["text"]`.
+
+    Una sola llamada con `axis=None` en vez de una por fila como hace
+    `zone_styler`: sobre 868 filas son 104 ms en vez de 177, y el coste deja de
+    crecer en número de llamadas a Python.
+    """
+    estilos = pd.DataFrame("", index=view.index, columns=view.columns)
+    dentro = verdes.reindex(view.index, fill_value=False).to_numpy(dtype=bool)
+    estilos.loc[dentro, :] = f"color: {p['fresh']}; font-weight: 600"
+    estilos.loc[~dentro, :] = f"color: {p['text']}"
+    return view.style.apply(lambda _: estilos, axis=None)
+
+
+def _aplicar_exigencia(region: str) -> None:
+    """Callback de la barra maestra: mueve los cuatro sliders de suelos.
+
+    Tiene que ser un callback y no código en línea porque Streamlit no permite
+    cambiar el valor de un widget ya instanciado en la misma pasada. Los
+    callbacks corren **antes** de re-ejecutar el script, así que los sliders de
+    abajo recogen los valores nuevos en la pasada siguiente.
+    """
+    nivel = st.session_state.get(f"exigencia_{region}")
+    if nivel is None:
+        return
+    for name, valor in suelos_de_exigencia(nivel).items():
+        st.session_state[f"suelo_{name}_{region}"] = valor
+
+
+def render_estado_corte(
+    cfg,
+    region: str,
+    day: str,
+    output_dir: str,
+    state_path: str,
+    chosen_sectors: list[str],
+    p: dict,
+) -> None:
+    """Quién está en punto de entrada, desde cuándo, y quién se ha caído.
+
+    Complementa a Telegram, que es un flujo y se pierde: si la alerta llegó hace
+    tres días y no se vio, esa información no está en ningún otro sitio.
+    """
+    days = tuple(d for d in corridas_en_disco(output_dir, region) if d <= day)
+    if not days:
+        st.info(
+            f"No hay CSV de {region} en `{output_dir}`. Esta vista recalcula el "
+            "corte desde los CSV, no desde la base de estado."
+        )
+        return
+
+    state = get_state(state_path)
+    configurados = {name: float(v) for name, v in (cfg.alerting.get("floors") or {}).items()}
+    efectivos = state.effective_floors(configurados)
+    overrides = state.floor_overrides()
+
+    st.caption(
+        f"Recalcula el corte **desde cero** sobre las {len(days)} corridas de "
+        f"{days[0]} a {days[-1]}, con los suelos de abajo. No se usa la columna "
+        "`alert` del CSV ni `snapshots.passed`: las corridas anteriores al "
+        "08-09-2026 se escribieron con otros umbrales, y compararlas entre sí "
+        "mostraría un cambio de configuración disfrazado de empresas "
+        "rompiéndose todas el mismo día. Por lo mismo, el filtro «Solo alertas» "
+        "de la barra lateral no se aplica aquí; el de sectores sí."
+    )
+
+    if overrides:
+        st.warning(
+            "**Suelos override activos**, distintos de `config.yaml`: "
+            + " · ".join(
+                f"{REGISTRY[n].label if n in REGISTRY else n} "
+                f"{configurados.get(n, float('nan')):g} → {v:g}"
+                for n, v in overrides.items()
+            )
+            + ". Es lo que están usando las alertas de Telegram."
+        )
+
+    # --- Suelos: barra maestra + los cuatro ---------------------------------
+    with st.container(border=True):
+        st.markdown("**Suelos absolutos** — valor crudo de la métrica, no percentil")
+
+        # `setdefault` en vez de `value=`: si se pasan los dos, Streamlit avisa
+        # de que el widget tiene default y a la vez valor en session_state.
+        st.session_state.setdefault(f"exigencia_{region}", EXIGENCIA_ANCLAS[2][0])
+        for name in FLOOR_KEYS:
+            st.session_state.setdefault(f"suelo_{name}_{region}", float(efectivos[name]))
+
+        nivel = st.slider(
+            "Exigencia general",
+            min_value=EXIGENCIA_ANCLAS[0][0],
+            max_value=EXIGENCIA_ANCLAS[-1][0],
+            step=1,
+            key=f"exigencia_{region}",
+            on_change=_aplicar_exigencia,
+            args=(region,),
+            help="**Qué cambia:** los cuatro suelos de abajo a la vez, "
+                 "recorriendo una senda cuyas cuatro anclas son juegos medidos "
+                 "con el motor real. La tercera es la que corre en producción.\n\n"
+                 "**No es un multiplicador**, y no podría serlo: los cuatro "
+                 "suelos están en escalas distintas y el RS sube a propósito "
+                 "menos que los de calidad, porque al ser retorno absoluto "
+                 "apretarlo en proporción dejaría el screener a cero en un año "
+                 "lateral.\n\n"
+                 "Al moverla se recalcula el corte sobre **todo el histórico**, "
+                 "así que las fechas de entrada y de salida cambian con ella.",
+        )
+        st.caption(
+            " · ".join(
+                f"{'**' if n == EXIGENCIA_ANCLAS[2][0] else ''}{n} {nombre}"
+                f"{' (en producción)**' if n == EXIGENCIA_ANCLAS[2][0] else ''}"
+                for n, nombre, _ in EXIGENCIA_ANCLAS
+            )
+        )
+
+        columnas = st.columns(len(FLOOR_KEYS))
+        floors: dict[str, float] = {}
+        for columna, name in zip(columnas, FLOOR_KEYS):
+            minimo, maximo, paso = FLOOR_LIMITS[name]
+            with columna:
+                ayuda = FLOOR_HELP.get(name, "")
+                en_uso = (
+                    f"override en uso: **{overrides[name]:g}**"
+                    if name in overrides
+                    else f"config.yaml: **{configurados.get(name, float('nan')):g}**"
+                )
+                floors[name] = st.slider(
+                    REGISTRY[name].label if name in REGISTRY else name,
+                    min_value=minimo,
+                    max_value=maximo,
+                    step=paso,
+                    key=f"suelo_{name}_{region}",
+                    help=f"{ayuda}\n\n---\n\n{en_uso}" if ayuda else en_uso,
+                )
+
+        # Si se toca un suelo a mano, la barra maestra se queda descolgada. Se
+        # detecta comparando, no guardando el nivel: el redondeo hace que varias
+        # posiciones den los mismos suelos, así que la inversa es ambigua.
+        # La maestra sobrescribe los cuatro suelos con los de su senda, así que
+        # si alguno está a mano por encima de ella, moverla lo *baja*. Es
+        # correcto —la senda manda sobre los cuatro— pero desconcierta si no se
+        # avisa: se ve como que subir la exigencia relaja un suelo.
+        de_la_senda = suelos_de_exigencia(nivel)
+        a_medida = floors != de_la_senda
+        aviso = f"Nivel: **{'personalizado' if a_medida else etiqueta_exigencia(nivel)}**"
+        if floors != efectivos:
+            aviso += "  ·  :orange[simulación: no cambia lo que se envía]"
+        st.caption(aviso)
+        if a_medida:
+            st.caption(
+                ":orange[Tienes suelos a mano. Mover la barra general los "
+                "reescribirá los cuatro con los de su senda, que ahora mismo "
+                "serían: ]"
+                + ", ".join(
+                    f"{REGISTRY[n].label if n in REGISTRY else n} {de_la_senda[n]:g}"
+                    for n in FLOOR_KEYS
+                )
+            )
+        if floors != efectivos and st.button(
+            "Volver a los suelos que están en uso", key=f"reset_suelos_{region}"
+        ):
+            for clave in (f"exigencia_{region}", *(f"suelo_{n}_{region}" for n in FLOOR_KEYS)):
+                st.session_state.pop(clave, None)
+            st.rerun()
+
+    # --- Recálculo ----------------------------------------------------------
+    largo = load_gate_history(output_dir, region, days)
+    if largo.empty:
+        st.info("Los CSV de esta región no tienen filas.")
+        return
+    if chosen_sectors:
+        largo = largo[largo["sector"].isin(chosen_sectors)]
+    if bool(largo["watchlist"].any()):
+        st.warning(
+            "Hay filas con `watchlist=True`: el motor les aplica los umbrales y "
+            "suelos de `alerting.watchlist`, que esta vista no recalcula. Los "
+            "colores de esas filas no son de fiar."
+        )
+
+    activas = metricas_activas(cfg, region)
+    comun = dict(
+        active=activas,
+        a_threshold=float(cfg.alerting["a_threshold"]),
+        b_threshold=float(cfg.alerting["b_threshold"]),
+        final_cut=float(cfg.alerting["final_cut"]),
+        require_data=bool(cfg.alerting.get("floors_require_data", True)),
+    )
+    recalculado = recompute_gate(largo, floors=floors, **comun)
+    info = etiquetar_tramos(tramos(matriz_de_pasos(recalculado, days)), days[-1])
+
+    hoy = recalculado[recalculado["snapshot_on"] == days[-1]].copy()
+    verdes = hoy.loc[hoy["pasa"], "score_calc"]
+    en_uso = recompute_gate(hoy, floors=efectivos, **comun)["pasa"].sum()
+
+    # --- Métricas -----------------------------------------------------------
+    kpis = st.columns(5)
+    kpis[0].metric(
+        "En punto de entrada",
+        len(verdes),
+        delta=None if len(verdes) == int(en_uso) else f"{len(verdes) - int(en_uso):+d} vs los en uso",
+        delta_color="off",
+    )
+    kpis[1].metric("Media del score", f"{verdes.mean():.1f}" if len(verdes) else "—")
+    kpis[2].metric("Mediana del score", f"{verdes.median():.1f}" if len(verdes) else "—")
+    kpis[3].metric(
+        "Entraron en la última corrida",
+        int((info["dentro"].fillna(False) & (info["corridas_dentro"] == 1)).sum()),
+    )
+    kpis[4].metric(
+        "Salieron en la última",
+        int((~info["dentro"].fillna(False) & info["visto"].fillna(False)
+             & (info["corridas_fuera"] == 1)).sum()),
+    )
+
+    avisos = []
+    sin_dato = int(hoy["motivo"].str.contains("sin dato", na=False).sum())
+    if sin_dato:
+        avisos.append(
+            f"{sin_dato} vetados por falta de dato en un suelo activo "
+            "(`floors_require_data`): bajar el slider **no** los rescata. "
+            "`cash_quality_fcf_ni` no da valor si el beneficio neto no es positivo."
+        )
+    saltos = [
+        (a, b)
+        for a, b in zip(days, days[1:])
+        if dias_habiles(date.fromisoformat(a), date.fromisoformat(b)) > 3
+    ]
+    if saltos:
+        avisos.append(
+            f"{len(saltos)} hueco(s) de más de 3 días hábiles entre corridas "
+            f"(p. ej. {saltos[0][0]} → {saltos[0][1]}). Los tramos en **corridas** "
+            "son exactos; los días hábiles, orientativos."
+        )
+    huerfanas = sorted(set(state.snapshot_dates(region)) - set(days))
+    if huerfanas:
+        avisos.append(
+            f"{len(huerfanas)} fecha(s) en `snapshots` sin CSV en disco "
+            f"({', '.join(huerfanas[:3])}…): no entran en este histórico."
+        )
+    if avisos:
+        st.caption(":orange[" + "  ·  ".join(avisos) + "]")
+
+    # --- Tabla --------------------------------------------------------------
+    controles = st.columns([2, 1.4, 1])
+    with controles[0]:
+        alcance = st.segmented_control(
+            "Filas",
+            ["Las que tocan el corte", "+ top 100 por score", "Todo el universo"],
+            default="+ top 100 por score",
+            key=f"corte_alcance_{region}",
+            help="**Qué cambia:** cuántas filas se muestran, no el corte.\n\n"
+                 "«Las que tocan el corte» deja solo las que están dentro o lo "
+                 "han estado en el histórico. Las otras dos añaden contexto: "
+                 "las que se quedan cerca y por qué. Las que están dentro "
+                 "aparecen siempre, con cualquiera de las tres.",
+        ) or "+ top 100 por score"
+    with controles[1]:
+        # Ordenar por score entrelaza verdes y grises, y eso desconcierta: un
+        # score alto ya no implica pasar el corte. `LFST` es el segundo mejor
+        # score de `us` y se queda fuera con un ROIC del 3,5%. El entrelazado es
+        # justamente esa información, pero buscar 11 verdes entre 100 grises
+        # cansa, así que se puede agrupar sin perder el orden por score dentro
+        # de cada grupo.
+        orden = st.segmented_control(
+            "Orden",
+            ["Score", "Dentro primero"],
+            default="Score",
+            key=f"corte_orden_{region}",
+            help="**Qué cambia:** solo el orden de la tabla.\n\n"
+                 "Con «Score» los verdes salen entrelazados con los grises, y "
+                 "eso **es** la información: puntuar alto dejó de implicar "
+                 "pasar el corte cuando el criterio pasó a ser absoluto. En "
+                 "`us` hay 91 grises con más score que el verde más bajo.\n\n"
+                 "«Dentro primero» agrupa dentro / salió / nunca, manteniendo "
+                 "el score dentro de cada grupo.",
+        ) or "Score"
+    with controles[2]:
+        colorear = st.toggle(
+            "Colorear", value=True, key=f"corte_color_{region}",
+            help="Apagarlo quita el Styler y la tabla va instantánea; el estado "
+                 "se sigue leyendo en la columna 🟢.",
+        )
+
+    tabla = (
+        hoy.set_index("symbol")
+        .join(info, how="left")
+        .reset_index()
+        .sort_values("score_calc", ascending=False)
+    )
+    tabla["dentro"] = tabla["dentro"].fillna(False).astype(bool)
+    tabla["visto"] = tabla["visto"].fillna(False).astype(bool)
+    if alcance == "Las que tocan el corte":
+        tabla = tabla[tabla["visto"]]
+    elif alcance == "+ top 100 por score":
+        # Las que tocan el corte van siempre, sea cual sea su score: son
+        # justamente las que se quiere no perder de vista.
+        tabla = pd.concat([tabla[tabla["visto"]], tabla.head(100)])
+        tabla = tabla.drop_duplicates(subset="symbol").sort_values("score_calc", ascending=False)
+
+    if orden == "Dentro primero":
+        # `estado` agrupa en el orden que interesa (dentro, salió, nunca) y el
+        # score sigue ordenando dentro de cada grupo.
+        prioridad = pd.Series(0, index=tabla.index)
+        prioridad[~tabla["dentro"] & tabla["visto"]] = 1
+        prioridad[~tabla["visto"]] = 2
+        tabla = tabla.assign(_grupo=prioridad).sort_values(
+            ["_grupo", "score_calc"], ascending=[True, False]
+        ).drop(columns="_grupo")
+
+    if tabla.empty:
+        st.info("Ninguna fila con estos filtros.")
+        return
+
+    # "Días dentro" y "Días fuera" van en columnas propias y no solo en el
+    # texto: son ordenables pinchando la cabecera, que es la forma de responder
+    # "¿qué acaba de entrar?" y "¿qué se cayó hace poco?". El recuento exacto de
+    # corridas se queda en `cuando`, porque los días hábiles son orientativos
+    # cuando hay huecos entre corridas y las corridas no.
+    columnas_tabla = [
+        "estado", "symbol", "name", "sector", "a_pct", "b_pct", "score_calc",
+        "dias_dentro", "dias_fuera", "cuando", "motivo",
+    ]
+    datos = tabla[columnas_tabla].reset_index(drop=True)
+    dentro = tabla["dentro"].reset_index(drop=True)
+    st.dataframe(
+        corte_styler(datos, dentro, p) if colorear else datos,
+        hide_index=True,
+        width="stretch",
+        key=f"corte_{region}_{day}",
+        column_config={
+            "estado": st.column_config.TextColumn("", width="small"),
+            "symbol": "Ticker",
+            "name": "Nombre",
+            "sector": "Sector",
+            "a_pct": st.column_config.NumberColumn("A_pct", format="%.0f"),
+            "b_pct": st.column_config.NumberColumn("B_pct", format="%.0f"),
+            "score_calc": st.column_config.NumberColumn("Score", format="%.1f"),
+            "dias_dentro": st.column_config.NumberColumn(
+                "Días dentro", format="%d", help="Días hábiles desde que entró en el corte."
+            ),
+            "dias_fuera": st.column_config.NumberColumn(
+                "Días fuera", format="%d", help="Días hábiles desde que salió del corte."
+            ),
+            "cuando": "Desde / salió",
+            "motivo": "Motivo (recalculado)",
+        },
+    )
+
+    # Las que estaban dentro y ya no se puntúan no pueden salir en la tabla,
+    # porque la tabla son los puntuados de la última corrida.
+    perdidas = [s for s in info.index[info["visto"].fillna(False)] if s not in set(hoy["symbol"])]
+    if perdidas:
+        with st.expander(f"{len(perdidas)} que estuvieron dentro y ya no se puntúan"):
+            st.caption(
+                "Sin fila en la última corrida: gate de tendencia, liquidez, "
+                "cobertura de datos, o salida del universo."
+            )
+            st.dataframe(
+                info.loc[perdidas, ["ultima_dentro", "corridas_dentro", "cuando"]],
+                width="stretch",
+            )
+
+    # --- Guardar ------------------------------------------------------------
+    _render_guardar_suelos(state, state_path, region, floors, configurados, efectivos, len(verdes))
+
+
+def _render_guardar_suelos(
+    state: AlertState,
+    state_path: str,
+    region: str,
+    floors: dict[str, float],
+    configurados: dict[str, float],
+    efectivos: dict[str, float],
+    n_verdes: int,
+) -> None:
+    """Persiste los suelos elegidos, o quita el override y vuelve a config.yaml.
+
+    Se guardan en `state.sqlite` y no en `config.yaml` porque el panel corre en
+    la misma máquina que el cron y el YAML está bajo git: escribirlo desde aquí
+    dejaría el repo sucio y el `git pull --ff-only` del despliegue fallaría.
+    """
+    hay_override = bool(state.floor_overrides())
+    if floors == efectivos and not hay_override:
+        return
+
+    ya_aplicados = floors == efectivos
+    titulo = (
+        "⚙️ Suelos en uso para las alertas"
+        if ya_aplicados
+        else "⚙️ Aplicar estos suelos a las alertas de Telegram"
+    )
+    with st.expander(titulo):
+        if ya_aplicados:
+            # Con override activo y sliders sin tocar, estos suelos ya son los
+            # que se envían: avisar de que "va a cambiar" sería mentir.
+            st.info(
+                "Estos son los suelos que ya están usando las alertas, guardados "
+                "aquí y no en `config.yaml`. Quitar el override vuelve al fichero."
+            )
+        elif floors == configurados:
+            st.info(
+                "Coinciden con `config.yaml`, así que aplicarlos equivale a quitar "
+                "el override y volver al fichero."
+            )
+        else:
+            st.warning(
+                "Cambia **lo que llega a Telegram** desde la siguiente corrida, "
+                "en todas las regiones. Con estos suelos hay "
+                f"**{n_verdes}** en punto de entrada en {region} hoy. "
+                "Los valores de `config.yaml` no se tocan: el override vive en "
+                "`state.sqlite` y el runner lo registra en su log."
+            )
+            st.caption(
+                " · ".join(
+                    f"{REGISTRY[n].label if n in REGISTRY else n}: "
+                    f"{configurados.get(n, float('nan')):g} → {v:g}"
+                    for n, v in floors.items()
+                    if v != configurados.get(n)
+                )
+                or "sin diferencias con config.yaml"
+            )
+
+        def aplicar(nuevos: dict[str, float] | None) -> None:
+            """Guarda y re-siembra los sliders desde los suelos que quedan en uso.
+
+            Sin el `pop`, al quitar el override los sliders se quedarían con los
+            valores viejos que Streamlit guarda en `session_state` y no volverían
+            a los de `config.yaml`: la vista diría una cosa y las alertas otra.
+            """
+            state.set_floor_overrides(nuevos)
+            for clave in (f"exigencia_{region}", *(f"suelo_{n}_{region}" for n in FLOOR_KEYS)):
+                st.session_state.pop(clave, None)
+            st.cache_data.clear()
+            st.rerun()
+
+        acciones = st.columns(2)
+        with acciones[0]:
+            if floors != efectivos:
+                confirmado = st.checkbox(
+                    "Lo entiendo", key=f"confirmar_suelos_{region}",
+                    help="Necesario para evitar aplicarlo de un clic por error.",
+                )
+                if st.button(
+                    "Aplicar", type="primary", disabled=not confirmado,
+                    key=f"guardar_suelos_{region}", width="stretch",
+                ):
+                    aplicar(None if floors == configurados else floors)
+        with acciones[1]:
+            if hay_override and st.button(
+                "Quitar el override", key=f"quitar_override_{region}", width="stretch",
+                help="Vuelve a los suelos de config.yaml para las alertas.",
+            ):
+                aplicar(None)
+
+
 def render_frescura(state_path: str, configuradas: list[str], p: dict) -> None:
     """Estado de actualización de TODAS las regiones configuradas.
 
@@ -844,10 +1745,18 @@ def main() -> None:
     if chosen_sectors:
         view = view[view["sector"].isin(chosen_sectors)]
 
-    tabs = st.tabs(["Ranking", "Detalle de un valor", "Histórico de alertas"])
+    # "Estado del corte" va primera: la pregunta por defecto al abrir el panel
+    # es "¿quién está dentro ahora y desde cuándo?", porque Telegram es un
+    # flujo y se pierde. El Ranking, con sus podios, es la vista de explorar.
+    tabs = st.tabs(["Estado del corte", "Ranking", "Detalle de un valor",
+                    "Histórico de alertas"])
+
+    # --- Estado del corte -------------------------------------------------
+    with tabs[0]:
+        render_estado_corte(cfg, region, day, output_dir, state_path, chosen_sectors, p)
 
     # --- Ranking ----------------------------------------------------------
-    with tabs[0]:
+    with tabs[1]:
         a_threshold = float(cfg.alerting["a_threshold"])
         b_threshold = float(cfg.alerting["b_threshold"])
         st.caption(
@@ -924,7 +1833,7 @@ def main() -> None:
                 )
 
     # --- Detalle ----------------------------------------------------------
-    with tabs[1]:
+    with tabs[2]:
         ordered = view.sort_values("score_final", ascending=False)
         if ordered.empty:
             st.info("Ningún valor cumple los filtros seleccionados.")
@@ -988,7 +1897,7 @@ def main() -> None:
                 )
 
     # --- Alertas ----------------------------------------------------------
-    with tabs[2]:
+    with tabs[3]:
         st.caption(
             "Solo se envía lo **nuevo** y lo que **mejora** de verdad: un valor ya "
             "avisado se silencia mientras siga en el corte sin moverse."

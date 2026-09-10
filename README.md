@@ -140,7 +140,8 @@ always saved, because they are the dashboard's history.
 streamlit run screener/panel.py
 ```
 
-Three tabs: **Ranking** (A_pct vs B_pct scatter plus the full table), **Stock
+Four tabs. **Cut status** comes first and is described below; then **Ranking**
+(A_pct vs B_pct scatter plus the full table), **Stock
 detail** (metric-by-metric contribution across both panels and the score history)
 and **Alert history** (with the type, new or improvement, and how the regime
 evolved). Since the absolute floors decide, the upper-right quadrant is no longer
@@ -150,6 +151,71 @@ so the green background marks the real alerts rather than the quadrant.
 It reads from two places, both written by the runner: `state.sqlite` for KPIs,
 daily rankings and alerts; and `out/<region>_<date>.csv` for the per-metric
 breakdown. History accumulates on its own, run after run.
+
+### Cut status
+
+Telegram is a stream, and a stream gets lost: if an alert arrived three days ago
+and went unread, that information is nowhere else. This tab is the complementary
+question — a snapshot of the state. Every scored name for one region, ordered by
+score, the ones currently at an entry point in green with a 🟢, how many business
+days and runs each has been in, and when the ones that dropped out left. Both
+"days in" and "days out" are their own sortable columns.
+
+Four sliders carry the absolute floors, plus a master **exigencia** bar that moves
+all four along a measured path. A single multiplier would be wrong: the four
+floors are on different scales, and `rs_multi_window` must not tighten in
+proportion to the quality ones, because it is an absolute return — it measures the
+market, not the company — and at 0.40 it would empty the screener in a flat year.
+The bar's four anchors are floor sets measured with the real `decide()`, and the
+third one is what production runs. Touch any single floor and the bar reads
+*personalizado*: the level is derived by comparison, never stored, because
+rounding makes several positions produce the same floors.
+
+**The tab recomputes the cut from the CSVs** rather than reading the `alert`
+column or `snapshots.passed`, for three independent reasons:
+
+1. **The stored history is not comparable with itself.** Runs before 2026-09-08
+   were written with the previous thresholds. Measured over 13 production runs of
+   `us`, the recorded column reads 44-49 passing until 07-Sep and then 11 — a
+   cliff that is a config change, not the market. Reading it would show 33
+   phantom exits on one day. Recomputed with one consistent rule the same history
+   reads 10-11 throughout, with **one** real exit.
+2. **`snapshots` carries stale rows.** `record_snapshot` uses INSERT OR REPLACE
+   keyed on `(region, symbol, snapshot_on)`, so re-running a day does not clear
+   the previous universe: `emerging/2026-08-05` holds 318 rows with `max(rank)`
+   314 and duplicate ranks. The CSVs are clean.
+3. It is what lets the sliders recompute the entry and exit dates too.
+
+Costs, measured on the 13-run `us` history (10,118 rows): 95 ms to load once,
+12 ms to recompute the gate, 11 ms to derive the streaks. Fast enough to run on
+every slider move.
+
+Two things it deliberately refuses to invent. A name that passes in *every*
+observed run gets "ya estaba dentro el <first date>" rather than a made-up entry
+date, since the real one predates the history — with a stable cut that is the
+common case. And `floors_require_data: true` is an invisible ceiling:
+`cash_quality_fcf_ni` returns nothing when net income is not positive, so lowering
+that slider to 0 does **not** rescue those names. The tab says so with a count,
+or the slider looks broken.
+
+`tests/test_estado_corte.py` ties the vectorised recompute to `decide()` row by
+row, reason string included. Two implementations of one rule will drift, and a
+view that paints green what the engine did not alert is worse than no view.
+
+### Saving floors from the panel
+
+A set of floors that convinces you can be applied to the live alerts from the
+tab. It is stored in `state.sqlite`, not written into `config.yaml`: the panel
+runs on the same machine as the cron, and `config.yaml` is under git, so writing
+it there would leave the repo dirty and break the next `git pull --ff-only`
+deploy. `runner.py` applies the override once at startup and logs every changed
+floor at INFO — a silent override would be miserable to debug the day the alerts
+stop matching the file. `config.yaml` stays the documentation of why each number
+is what it is; clearing the override returns to it.
+
+The scope is deliberate: only the live runner. `backtest.py` loads the config but
+never reaches `decide()` — it sweeps thresholds itself — so studies keep measuring
+declared parameters rather than a knob turned by hand.
 
 ### Choosing what reaches Telegram
 
@@ -300,7 +366,7 @@ the whole region is disabled for that run and the weights renormalize.
 .venv/bin/python -m pytest -q
 ```
 
-250 tests, none of which touch the network: synthetic price series and financial
+284 tests, none of which touch the network: synthetic price series and financial
 statements, plus a full pipeline against a fake provider.
 
 First real US run (2026-07-31): 1,627 screener candidates → 1,598 after
@@ -414,7 +480,7 @@ sudo systemctl enable --now cron
 
 git clone <repo> /opt/swing-screener && cd /opt/swing-screener
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m pytest -q          # 250 tests, no network: verifies the platform
+.venv/bin/python -m pytest -q          # 284 tests, no network: verifies the platform
 
 cp .env.example .env                   # optional: without it, alerts print to console
 ```

@@ -1,4 +1,9 @@
-"""Interruptores de envío a Telegram, por región y por sector."""
+"""Preferencias que el panel escribe y el cron lee: envío y suelos.
+
+Las dos comparten el mismo patrón —viven en `state.sqlite`, que es lo único
+que comparten los dos procesos, y la ausencia de fila significa "sin tocar"—
+así que se testean juntas.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +14,7 @@ import pytest
 from screener.config import load_config
 from screener.engine import RegionRun
 from screener.models import TickerResult
-from screener.runner import dispatch
+from screener.runner import apply_floor_overrides, dispatch
 from screener.state import AlertState
 
 TODAY = date(2025, 3, 10)
@@ -134,3 +139,124 @@ def test_a_disabled_sector_is_skipped_but_its_peers_are_not(cfg_tmp):
         alerting("CHIP", sector="Technology"),
     ])
     assert dispatch(run, cfg_tmp, dry_run=True, send_summary=False) == 1
+
+
+# ---------------------------------------------------------------------------
+# Suelos absolutos elegidos desde el panel
+# ---------------------------------------------------------------------------
+def test_sin_override_manda_config_yaml(state, cfg_tmp):
+    configurados = dict(cfg_tmp.alerting["floors"])
+    assert state.floor_overrides() == {}
+    assert state.effective_floors(configurados) == configurados
+
+
+def test_el_override_pisa_solo_el_suelo_indicado(state, cfg_tmp):
+    configurados = dict(cfg_tmp.alerting["floors"])
+    state.set_floor_overrides({"roic_vs_sector": 0.22})
+
+    efectivos = state.effective_floors(configurados)
+    assert efectivos["roic_vs_sector"] == 0.22
+    for name, valor in configurados.items():
+        if name != "roic_vs_sector":
+            assert efectivos[name] == valor
+
+
+def test_el_override_conserva_el_orden_de_config_yaml(state, cfg_tmp):
+    """`decide` evalúa los suelos en orden y el primero que falla es el motivo.
+
+    Un override que reordenara el dict cambiaría los mensajes de rechazo sin
+    cambiar ninguna decisión, que es la clase de bug que nadie encuentra.
+    """
+    configurados = dict(cfg_tmp.alerting["floors"])
+    state.set_floor_overrides({"rs_multi_window": 0.9, "revenue_growth_level": 0.9})
+
+    assert list(state.effective_floors(configurados)) == list(configurados)
+
+
+def test_vaciar_el_override_vuelve_a_config_yaml(state, cfg_tmp):
+    configurados = dict(cfg_tmp.alerting["floors"])
+    state.set_floor_overrides({"roic_vs_sector": 0.22})
+    state.set_floor_overrides(None)
+
+    assert state.floor_overrides() == {}
+    assert state.effective_floors(configurados) == configurados
+
+
+def test_se_reemplaza_el_juego_entero_no_metrica_a_metrica(state, cfg_tmp):
+    """Un juego de suelos es una decisión conjunta.
+
+    Dejar tres nuevos y uno viejo daría un cuarto juego que nadie eligió.
+    """
+    state.set_floor_overrides({"roic_vs_sector": 0.22, "revenue_growth_level": 0.4})
+    state.set_floor_overrides({"roic_vs_sector": 0.19})
+
+    assert state.floor_overrides() == {"roic_vs_sector": 0.19}
+
+
+def test_una_metrica_inventada_se_rechaza(state):
+    """Sería un suelo que no filtra y que nunca daría error.
+
+    Los suelos de métricas que la región no calcula se ignoran a propósito, así
+    que un nombre mal escrito pasaría desapercibido para siempre.
+    """
+    with pytest.raises(ValueError, match="no registradas"):
+        state.set_floor_overrides({"revenue_growht_level": 0.25})  # typo a propósito
+
+
+def test_un_suelo_fuera_de_config_yaml_no_se_cuela(state, cfg_tmp):
+    """El override mueve un umbral; no inventa un suelo que el YAML no documenta."""
+    configurados = dict(cfg_tmp.alerting["floors"])
+    state.set_floor_overrides({"estimate_revisions": 9.0})
+
+    assert state.effective_floors(configurados) == configurados
+
+
+def test_el_runner_aplica_el_override_al_arrancar(cfg_tmp):
+    """Sin esto el panel escribiría en una tabla que nadie lee.
+
+    Se comprueba sobre el `cfg` que el runner usa después para puntuar, no sobre
+    el valor devuelto: es `cfg.alerting["floors"]` lo que `decide` va a leer.
+    """
+    configurados = dict(cfg_tmp.alerting["floors"])
+    AlertState(cfg_tmp.run["state_db"]).set_floor_overrides({"roic_vs_sector": 0.33})
+
+    cambiados = apply_floor_overrides(cfg_tmp)
+
+    assert cambiados == {"roic_vs_sector": 0.33}
+    assert cfg_tmp.alerting["floors"]["roic_vs_sector"] == 0.33
+    assert cfg_tmp.alerting["floors"]["revenue_growth_level"] == configurados["revenue_growth_level"]
+
+
+def test_el_runner_no_toca_nada_si_no_hay_override(cfg_tmp):
+    configurados = dict(cfg_tmp.alerting["floors"])
+    AlertState(cfg_tmp.run["state_db"])  # crea la base, sin overrides
+
+    assert apply_floor_overrides(cfg_tmp) == {}
+    assert cfg_tmp.alerting["floors"] == configurados
+
+
+def test_un_override_igual_a_config_no_cuenta_como_cambio(cfg_tmp):
+    """Guardar los mismos valores no debe ensuciar el log de cada corrida."""
+    AlertState(cfg_tmp.run["state_db"]).set_floor_overrides(dict(cfg_tmp.alerting["floors"]))
+
+    assert apply_floor_overrides(cfg_tmp) == {}
+
+
+def test_los_suelos_se_releen_del_disco_en_cada_consulta(tmp_path):
+    """Sin caché por instancia, a diferencia de `delivery_map`.
+
+    El panel guarda su `AlertState` en `st.cache_resource`, que vive lo que vive
+    el proceso. Con caché, una escritura hecha desde otra instancia dejaba el
+    aviso de "suelos override activos" mostrando algo falso — y ese aviso dice
+    qué está usando Telegram, así que mentir ahí es lo peor que puede hacer esa
+    pantalla. Se puede permitir releer: se consulta una vez por corrida y una o
+    dos por render, no una vez por alerta.
+    """
+    ruta = tmp_path / "state.sqlite"
+    panel = AlertState(ruta)
+    cron = AlertState(ruta)
+
+    assert panel.floor_overrides() == {}  # deja "cacheada" la respuesta vacía
+    cron.set_floor_overrides({"roic_vs_sector": 0.22})
+
+    assert panel.floor_overrides() == {"roic_vs_sector": 0.22}
