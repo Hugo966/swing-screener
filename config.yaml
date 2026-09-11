@@ -128,12 +128,23 @@ alerting:
     # de arriba: un corte por encima del producto de sus umbrales los anularía.
     final_cut: 15
     # Suelos más laxos, no ausentes: de un nombre que ya sigues quieres saber
-    # que se mueve antes que exigirle el pleno.
+    # que se mueve antes que exigirle el pleno. Que sea permisivo es deliberado
+    # — con los suelos del canal principal pasaría el 1,7% del universo, y de una
+    # lista de veinte nombres elegidos a mano no te enterarías nunca de nada.
+    #
+    # Pero permisivo no es vacío, y en 0,05 lo eran: un ROIC del 5% está por
+    # debajo de cualquier coste de capital (admite destructores de valor) y unas
+    # ventas +5% son inflación. Estos cuatro sí tienen lectura económica, y dejan
+    # el canal en el 6-12% del universo según la región, aproximadamente el doble
+    # de permisivo que el principal. Medido el 11-09-2026 sobre la última corrida
+    # de cada región con los umbrales de abajo (40/40, corte 15):
+    #   us 11,9% · emerging 9,0% · europe_dev 12,4% · korea 6,1%
     floors:
-      revenue_growth_level: 0.05
-      roic_vs_sector: 0.05
-      cash_quality_fcf_ni: 0.30
-      rs_multi_window: 0.10
+      revenue_growth_level: 0.10   # +10% Y/Y: crece por encima de la inflación
+      roic_vs_sector: 0.10         # ROIC 10%: en torno al coste de capital, no
+                                   # destruye valor
+      cash_quality_fcf_ni: 0.50    # al menos la mitad del beneficio es caja
+      rs_multi_window: 0.15        # +15% ponderado: se ha movido algo
     separate_channel: true
 
 # ---------------------------------------------------------------------
