@@ -12,8 +12,10 @@ __pycache__/
 # --- Runtime state and outputs -----------------------------------------
 # Local price/fundamentals cache: ~1 GB, fully regenerable from the provider.
 .cache/
-# Alert de-duplication state (SQLite): machine-local, not shareable.
-state.sqlite
+# Alert de-duplication state (SQLite): machine-local, not shareable. The glob
+# also covers sqlite's -wal/-shm sidecars and the .anterior copy that
+# ~/bin/sync-swing.sh leaves before overwriting it.
+state.sqlite*
 # Daily screener output CSVs.
 out/
 
